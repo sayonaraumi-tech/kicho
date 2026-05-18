@@ -1,0 +1,2311 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+<title>記帳システム</title>
+<meta name="description" content="内装工事会社 内部記帳システム">
+<meta name="theme-color" content="#1F4E78">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="default">
+<meta name="apple-mobile-web-app-title" content="記帳">
+<link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Crect width='100' height='100' rx='20' fill='%231F4E78'/%3E%3Ctext x='50' y='70' font-size='60' text-anchor='middle' fill='white' font-family='serif' font-weight='bold'%3E帳%3C/text%3E%3C/svg%3E">
+
+<style>
+body { margin: 0; font-family: "Hiragino Sans", "Yu Gothic", sans-serif; background: #f5f5f4; }
+#loading { display: flex; align-items: center; justify-content: center; min-height: 100vh; flex-direction: column; gap: 12px; color: #57534e; padding: 20px; text-align: center; }
+#loading .spinner { width: 40px; height: 40px; border: 3px solid #e7e5e4; border-top-color: #1F4E78; border-radius: 50%; animation: spin 0.8s linear infinite; }
+#loading .status { font-size: 12px; color: #78716c; margin-top: 4px; }
+@keyframes spin { to { transform: rotate(360deg); } }
+#error-box { display: none; padding: 20px; max-width: 600px; margin: 40px auto; background: #fef2f2; border: 2px solid #dc2626; border-radius: 8px; }
+#error-box h2 { color: #991b1b; margin-top: 0; }
+#error-box pre { background: #1f2937; color: #fca5a5; padding: 12px; border-radius: 4px; overflow-x: auto; white-space: pre-wrap; word-break: break-all; font-size: 12px; }
+#error-box button { background: #1F4E78; color: white; border: 0; padding: 10px 16px; border-radius: 4px; cursor: pointer; margin: 4px; font-size: 14px; }
+.online-only { display: none; color: #6b7280; font-size: 13px; margin-top: 16px; max-width: 400px; text-align: center; line-height: 1.6; }
+</style>
+</head>
+<body>
+<div id="root">
+  <div id="loading">
+    <div class="spinner"></div>
+    <div>読み込み中...</div>
+    <div class="status" id="load-status">ライブラリを準備しています...</div>
+    <div class="online-only" id="offline-hint">
+      📡 ライブラリの読み込みに時間がかかっています。<br>
+      <strong>ファイルアプリのプレビューでは動作しません。</strong><br>
+      GitHub Pages にデプロイしてブラウザで開いてください。
+    </div>
+  </div>
+</div>
+<div id="error-box">
+  <h2>⚠️ エラー</h2>
+  <p id="error-context"></p>
+  <pre id="error-message"></pre>
+  <button onclick="location.reload()">再読み込み</button>
+  <button onclick="if(confirm('保存されたデータを削除しますか?')){localStorage.clear();location.reload();}">データをリセット</button>
+</div>
+
+<script>
+// グローバルエラーキャッチ
+window.addEventListener('error', function(e) {
+  if (e.message && e.message.indexOf('ResizeObserver') !== -1) return; // 無視
+  showError('JavaScript エラー', (e.error && e.error.stack) || e.message || String(e));
+});
+window.addEventListener('unhandledrejection', function(e) {
+  showError('Promise エラー', (e.reason && e.reason.stack) || String(e.reason));
+});
+function showError(title, msg) {
+  var box = document.getElementById('error-box');
+  var loading = document.getElementById('loading');
+  if (loading) loading.style.display = 'none';
+  if (box) {
+    box.style.display = 'block';
+    var ctx = document.getElementById('error-context');
+    if (ctx) ctx.textContent = title;
+    document.getElementById('error-message').textContent = msg;
+  }
+}
+function setStatus(msg) {
+  var el = document.getElementById('load-status');
+  if (el) el.textContent = msg;
+}
+
+// オンライン状態確認
+if (!navigator.onLine) {
+  setTimeout(function() {
+    var hint = document.getElementById('offline-hint');
+    if (hint) hint.style.display = 'block';
+  }, 1500);
+}
+
+// ストレージ + Gist 同期
+window.storage = {
+  get: function(key) {
+    return new Promise(function(resolve) {
+      try {
+        var v = localStorage.getItem('accounting_' + key);
+        resolve(v ? { key: key, value: v } : null);
+      } catch(e) { resolve(null); }
+    });
+  },
+  set: function(key, value) {
+    return new Promise(function(resolve) {
+      try {
+        localStorage.setItem('accounting_' + key, value);
+        resolve({ key: key, value: value });
+      } catch(e) { resolve(null); }
+    });
+  }
+};
+
+// Gist 同期 API
+window.gistSync = {
+  // GitHub Personal Access Token と Gist ID を localStorage に保存
+  getConfig: function() {
+    return {
+      token: localStorage.getItem('gist_token') || '',
+      gistId: localStorage.getItem('gist_id') || '',
+    };
+  },
+  saveConfig: function(token, gistId) {
+    localStorage.setItem('gist_token', token);
+    localStorage.setItem('gist_id', gistId);
+  },
+  // データをアップロード
+  upload: async function(data) {
+    var cfg = this.getConfig();
+    if (!cfg.token || !cfg.gistId) throw new Error('Gist 設定が未完了です');
+    var res = await fetch('https://api.github.com/gists/' + cfg.gistId, {
+      method: 'PATCH',
+      headers: {
+        'Authorization': 'token ' + cfg.token,
+        'Accept': 'application/vnd.github.v3+json',
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        files: {
+          'accounting_data.json': {
+            content: JSON.stringify(data, null, 2)
+          }
+        }
+      })
+    });
+    if (!res.ok) {
+      var err = await res.text();
+      throw new Error('Gist アップロード失敗: ' + res.status + ' ' + err);
+    }
+    return await res.json();
+  },
+  // データをダウンロード
+  download: async function() {
+    var cfg = this.getConfig();
+    if (!cfg.token || !cfg.gistId) throw new Error('Gist 設定が未完了です');
+    var res = await fetch('https://api.github.com/gists/' + cfg.gistId, {
+      headers: {
+        'Authorization': 'token ' + cfg.token,
+        'Accept': 'application/vnd.github.v3+json',
+      }
+    });
+    if (!res.ok) throw new Error('Gist ダウンロード失敗: ' + res.status);
+    var gist = await res.json();
+    var file = gist.files['accounting_data.json'];
+    if (!file) throw new Error('accounting_data.json が見つかりません');
+    return JSON.parse(file.content);
+  }
+};
+</script>
+
+<!-- Tailwind と各種ライブラリ -->
+<script src="https://cdn.tailwindcss.com" onerror="setStatus('Tailwind 読み込み失敗 - 再試行中...')"></script>
+<script src="https://unpkg.com/react@18.3.1/umd/react.production.min.js" crossorigin onerror="setStatus('React 読み込み失敗')"></script>
+<script src="https://unpkg.com/react-dom@18.3.1/umd/react-dom.production.min.js" crossorigin onerror="setStatus('ReactDOM 読み込み失敗')"></script>
+<script src="https://unpkg.com/recharts@2.12.7/umd/Recharts.min.js" crossorigin onerror="setStatus('Recharts 読み込み失敗')"></script>
+<script src="https://unpkg.com/xlsx@0.18.5/dist/xlsx.full.min.js" crossorigin onerror="setStatus('XLSX 読み込み失敗')"></script>
+<script src="https://unpkg.com/papaparse@5.4.1/papaparse.min.js" crossorigin onerror="setStatus('PapaParse 読み込み失敗')"></script>
+
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Noto+Sans+JP:wght@400;500;700&family=Noto+Serif+JP:wght@500;700&display=swap" rel="stylesheet">
+
+<style>
+body { font-family: "Noto Sans JP", "Hiragino Sans", "Yu Gothic", sans-serif; }
+.font-serif { font-family: "Noto Serif JP", serif; }
+::-webkit-scrollbar { width: 8px; height: 8px; }
+::-webkit-scrollbar-track { background: #f5f5f4; }
+::-webkit-scrollbar-thumb { background: #d6d3d1; border-radius: 4px; }
+select { -webkit-appearance: none; -moz-appearance: none; appearance: none;
+  background-image: url("data:image/svg+xml;charset=UTF-8,%3csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23999' stroke-width='2'%3e%3cpath d='M6 9l6 6 6-6'/%3e%3c/svg%3e");
+  background-repeat: no-repeat; background-position: right 4px center; background-size: 12px;
+  padding-right: 18px !important;
+}
+input[type="number"]::-webkit-outer-spin-button,
+input[type="number"]::-webkit-inner-spin-button { -webkit-appearance: none; margin: 0; }
+input[type="number"] { -moz-appearance: textfield; }
+</style>
+
+<script>
+function waitForLibs(callback) {
+  var tries = 0;
+  var maxTries = 200; // 20 秒
+  function check() {
+    tries++;
+    var missing = [];
+    if (!window.React) missing.push('React');
+    if (!window.ReactDOM) missing.push('ReactDOM');
+    if (!window.Recharts) missing.push('Recharts');
+    if (!window.XLSX) missing.push('XLSX');
+    if (!window.Papa) missing.push('PapaParse');
+    if (missing.length === 0) {
+      setStatus('起動中...');
+      callback();
+      return;
+    }
+    setStatus('読み込み中: 残り ' + missing.join(', '));
+    // 5秒以上待ってるならヒント表示
+    if (tries === 50) {
+      var hint = document.getElementById('offline-hint');
+      if (hint) hint.style.display = 'block';
+    }
+    if (tries > maxTries) {
+      showError('ライブラリ読み込み失敗',
+        '読み込めなかったライブラリ: ' + missing.join(', ') + '\n\n' +
+        '【考えられる原因】\n' +
+        '1. インターネット接続が不安定\n' +
+        '2. ファイルアプリのプレビューで開いている (Safari/Chromeブラウザで開いてください)\n' +
+        '3. CDN がブロックされている\n\n' +
+        '【解決方法】\n' +
+        'GitHub Pages にデプロイして、ブラウザでアクセスしてください。');
+      return;
+    }
+    setTimeout(check, 100);
+  }
+  check();
+}
+
+waitForLibs(function() {
+  try {
+    "use strict";
+    
+    function _typeof(o) { "@babel/helpers - typeof"; return _typeof = "function" == typeof Symbol && "symbol" == typeof Symbol.iterator ? function (o) { return typeof o; } : function (o) { return o && "function" == typeof Symbol && o.constructor === Symbol && o !== Symbol.prototype ? "symbol" : typeof o; }, _typeof(o); }
+    var _excluded = ["name", "size", "className"];
+    function _toConsumableArray(r) { return _arrayWithoutHoles(r) || _iterableToArray(r) || _unsupportedIterableToArray(r) || _nonIterableSpread(); }
+    function _nonIterableSpread() { throw new TypeError("Invalid attempt to spread non-iterable instance.\nIn order to be iterable, non-array objects must have a [Symbol.iterator]() method."); }
+    function _iterableToArray(r) { if ("undefined" != typeof Symbol && null != r[Symbol.iterator] || null != r["@@iterator"]) return Array.from(r); }
+    function _arrayWithoutHoles(r) { if (Array.isArray(r)) return _arrayLikeToArray(r); }
+    function _regenerator() { /*! regenerator-runtime -- Copyright (c) 2014-present, Facebook, Inc. -- license (MIT): https://github.com/babel/babel/blob/main/packages/babel-helpers/LICENSE */ var e, t, r = "function" == typeof Symbol ? Symbol : {}, n = r.iterator || "@@iterator", o = r.toStringTag || "@@toStringTag"; function i(r, n, o, i) { var c = n && n.prototype instanceof Generator ? n : Generator, u = Object.create(c.prototype); return _regeneratorDefine2(u, "_invoke", function (r, n, o) { var i, c, u, f = 0, p = o || [], y = !1, G = { p: 0, n: 0, v: e, a: d, f: d.bind(e, 4), d: function d(t, r) { return i = t, c = 0, u = e, G.n = r, a; } }; function d(r, n) { for (c = r, u = n, t = 0; !y && f && !o && t < p.length; t++) { var o, i = p[t], d = G.p, l = i[2]; r > 3 ? (o = l === n) && (u = i[(c = i[4]) ? 5 : (c = 3, 3)], i[4] = i[5] = e) : i[0] <= d && ((o = r < 2 && d < i[1]) ? (c = 0, G.v = n, G.n = i[1]) : d < l && (o = r < 3 || i[0] > n || n > l) && (i[4] = r, i[5] = n, G.n = l, c = 0)); } if (o || r > 1) return a; throw y = !0, n; } return function (o, p, l) { if (f > 1) throw TypeError("Generator is already running"); for (y && 1 === p && d(p, l), c = p, u = l; (t = c < 2 ? e : u) || !y;) { i || (c ? c < 3 ? (c > 1 && (G.n = -1), d(c, u)) : G.n = u : G.v = u); try { if (f = 2, i) { if (c || (o = "next"), t = i[o]) { if (!(t = t.call(i, u))) throw TypeError("iterator result is not an object"); if (!t.done) return t; u = t.value, c < 2 && (c = 0); } else 1 === c && (t = i["return"]) && t.call(i), c < 2 && (u = TypeError("The iterator does not provide a '" + o + "' method"), c = 1); i = e; } else if ((t = (y = G.n < 0) ? u : r.call(n, G)) !== a) break; } catch (t) { i = e, c = 1, u = t; } finally { f = 1; } } return { value: t, done: y }; }; }(r, o, i), !0), u; } var a = {}; function Generator() {} function GeneratorFunction() {} function GeneratorFunctionPrototype() {} t = Object.getPrototypeOf; var c = [][n] ? t(t([][n]())) : (_regeneratorDefine2(t = {}, n, function () { return this; }), t), u = GeneratorFunctionPrototype.prototype = Generator.prototype = Object.create(c); function f(e) { return Object.setPrototypeOf ? Object.setPrototypeOf(e, GeneratorFunctionPrototype) : (e.__proto__ = GeneratorFunctionPrototype, _regeneratorDefine2(e, o, "GeneratorFunction")), e.prototype = Object.create(u), e; } return GeneratorFunction.prototype = GeneratorFunctionPrototype, _regeneratorDefine2(u, "constructor", GeneratorFunctionPrototype), _regeneratorDefine2(GeneratorFunctionPrototype, "constructor", GeneratorFunction), GeneratorFunction.displayName = "GeneratorFunction", _regeneratorDefine2(GeneratorFunctionPrototype, o, "GeneratorFunction"), _regeneratorDefine2(u), _regeneratorDefine2(u, o, "Generator"), _regeneratorDefine2(u, n, function () { return this; }), _regeneratorDefine2(u, "toString", function () { return "[object Generator]"; }), (_regenerator = function _regenerator() { return { w: i, m: f }; })(); }
+    function _regeneratorDefine2(e, r, n, t) { var i = Object.defineProperty; try { i({}, "", {}); } catch (e) { i = 0; } _regeneratorDefine2 = function _regeneratorDefine(e, r, n, t) { function o(r, n) { _regeneratorDefine2(e, r, function (e) { return this._invoke(r, n, e); }); } r ? i ? i(e, r, { value: n, enumerable: !t, configurable: !t, writable: !t }) : e[r] = n : (o("next", 0), o("throw", 1), o("return", 2)); }, _regeneratorDefine2(e, r, n, t); }
+    function asyncGeneratorStep(n, t, e, r, o, a, c) { try { var i = n[a](c), u = i.value; } catch (n) { return void e(n); } i.done ? t(u) : Promise.resolve(u).then(r, o); }
+    function _asyncToGenerator(n) { return function () { var t = this, e = arguments; return new Promise(function (r, o) { var a = n.apply(t, e); function _next(n) { asyncGeneratorStep(a, r, o, _next, _throw, "next", n); } function _throw(n) { asyncGeneratorStep(a, r, o, _next, _throw, "throw", n); } _next(void 0); }); }; }
+    function _slicedToArray(r, e) { return _arrayWithHoles(r) || _iterableToArrayLimit(r, e) || _unsupportedIterableToArray(r, e) || _nonIterableRest(); }
+    function _nonIterableRest() { throw new TypeError("Invalid attempt to destructure non-iterable instance.\nIn order to be iterable, non-array objects must have a [Symbol.iterator]() method."); }
+    function _unsupportedIterableToArray(r, a) { if (r) { if ("string" == typeof r) return _arrayLikeToArray(r, a); var t = {}.toString.call(r).slice(8, -1); return "Object" === t && r.constructor && (t = r.constructor.name), "Map" === t || "Set" === t ? Array.from(r) : "Arguments" === t || /^(?:Ui|I)nt(?:8|16|32)(?:Clamped)?Array$/.test(t) ? _arrayLikeToArray(r, a) : void 0; } }
+    function _arrayLikeToArray(r, a) { (null == a || a > r.length) && (a = r.length); for (var e = 0, n = Array(a); e < a; e++) n[e] = r[e]; return n; }
+    function _iterableToArrayLimit(r, l) { var t = null == r ? null : "undefined" != typeof Symbol && r[Symbol.iterator] || r["@@iterator"]; if (null != t) { var e, n, i, u, a = [], f = !0, o = !1; try { if (i = (t = t.call(r)).next, 0 === l) { if (Object(t) !== t) return; f = !1; } else for (; !(f = (e = i.call(t)).done) && (a.push(e.value), a.length !== l); f = !0); } catch (r) { o = !0, n = r; } finally { try { if (!f && null != t["return"] && (u = t["return"](), Object(u) !== u)) return; } finally { if (o) throw n; } } return a; } }
+    function _arrayWithHoles(r) { if (Array.isArray(r)) return r; }
+    function ownKeys(e, r) { var t = Object.keys(e); if (Object.getOwnPropertySymbols) { var o = Object.getOwnPropertySymbols(e); r && (o = o.filter(function (r) { return Object.getOwnPropertyDescriptor(e, r).enumerable; })), t.push.apply(t, o); } return t; }
+    function _objectSpread(e) { for (var r = 1; r < arguments.length; r++) { var t = null != arguments[r] ? arguments[r] : {}; r % 2 ? ownKeys(Object(t), !0).forEach(function (r) { _defineProperty(e, r, t[r]); }) : Object.getOwnPropertyDescriptors ? Object.defineProperties(e, Object.getOwnPropertyDescriptors(t)) : ownKeys(Object(t)).forEach(function (r) { Object.defineProperty(e, r, Object.getOwnPropertyDescriptor(t, r)); }); } return e; }
+    function _defineProperty(e, r, t) { return (r = _toPropertyKey(r)) in e ? Object.defineProperty(e, r, { value: t, enumerable: !0, configurable: !0, writable: !0 }) : e[r] = t, e; }
+    function _toPropertyKey(t) { var i = _toPrimitive(t, "string"); return "symbol" == _typeof(i) ? i : i + ""; }
+    function _toPrimitive(t, r) { if ("object" != _typeof(t) || !t) return t; var e = t[Symbol.toPrimitive]; if (void 0 !== e) { var i = e.call(t, r || "default"); if ("object" != _typeof(i)) return i; throw new TypeError("@@toPrimitive must return a primitive value."); } return ("string" === r ? String : Number)(t); }
+    function _objectWithoutProperties(e, t) { if (null == e) return {}; var o, r, i = _objectWithoutPropertiesLoose(e, t); if (Object.getOwnPropertySymbols) { var n = Object.getOwnPropertySymbols(e); for (r = 0; r < n.length; r++) o = n[r], -1 === t.indexOf(o) && {}.propertyIsEnumerable.call(e, o) && (i[o] = e[o]); } return i; }
+    function _objectWithoutPropertiesLoose(r, e) { if (null == r) return {}; var t = {}; for (var n in r) if ({}.hasOwnProperty.call(r, n)) { if (-1 !== e.indexOf(n)) continue; t[n] = r[n]; } return t; }
+    var _React = React,
+      useState = _React.useState,
+      useEffect = _React.useEffect,
+      useMemo = _React.useMemo,
+      useRef = _React.useRef,
+      useCallback = _React.useCallback;
+    var _Recharts = Recharts,
+      BarChart = _Recharts.BarChart,
+      Bar = _Recharts.Bar,
+      LineChart = _Recharts.LineChart,
+      Line = _Recharts.Line,
+      XAxis = _Recharts.XAxis,
+      YAxis = _Recharts.YAxis,
+      CartesianGrid = _Recharts.CartesianGrid,
+      Tooltip = _Recharts.Tooltip,
+      Legend = _Recharts.Legend,
+      ResponsiveContainer = _Recharts.ResponsiveContainer,
+      PieChart = _Recharts.PieChart,
+      Pie = _Recharts.Pie,
+      Cell = _Recharts.Cell;
+    
+    // ===== Icon Component =====
+    var ICONS = {
+      Home: 'M3 9l9-7 9 7v11a2 2 0 01-2 2H5a2 2 0 01-2-2z M9 22V12h6v10',
+      Book: 'M4 19.5A2.5 2.5 0 016.5 17H20M6.5 2H20v20H6.5A2.5 2.5 0 014 19.5v-15A2.5 2.5 0 016.5 2z',
+      Wallet: 'M21 12V7H5a2 2 0 010-4h14v4M3 5v14a2 2 0 002 2h16v-5M18 12a2 2 0 000 4h4v-4z',
+      FileText: 'M14 2H6a2 2 0 00-2 2v16a2 2 0 002 2h12a2 2 0 002-2V8l-6-6z M14 2v6h6 M16 13H8 M16 17H8 M10 9H8',
+      Download: 'M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4 M7 10l5 5 5-5 M12 15V3',
+      Upload: 'M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4 M17 8l-5-5-5 5 M12 3v12',
+      Plus: 'M5 12h14 M12 5v14',
+      Trash: 'M3 6h18 M19 6v14a2 2 0 01-2 2H7a2 2 0 01-2-2V6m3 0V4a2 2 0 012-2h4a2 2 0 012 2v2',
+      Save: 'M19 21H5a2 2 0 01-2-2V5a2 2 0 012-2h11l5 5v11a2 2 0 01-2 2z M17 21v-8H7v8 M7 3v5h8',
+      Calendar: 'M19 4H5a2 2 0 00-2 2v14a2 2 0 002 2h14a2 2 0 002-2V6a2 2 0 00-2-2z M16 2v4 M8 2v4 M3 10h18',
+      ChevronLeft: 'M15 18l-6-6 6-6',
+      ChevronRight: 'M9 18l6-6-6-6',
+      Search: 'M21 21l-4.35-4.35 M11 19a8 8 0 100-16 8 8 0 000 16z',
+      TrendingUp: 'M22 7l-8.5 8.5-5-5L2 17 M16 7h6v6',
+      TrendingDown: 'M22 17l-8.5-8.5-5 5L2 7 M16 17h6v-6',
+      Settings: 'M12 15a3 3 0 100-6 3 3 0 000 6z M19.4 15a1.65 1.65 0 00.33 1.82l.06.06a2 2 0 11-2.83 2.83l-.06-.06a1.65 1.65 0 00-1.82-.33 1.65 1.65 0 00-1 1.51V21a2 2 0 11-4 0v-.09A1.65 1.65 0 009 19.4a1.65 1.65 0 00-1.82.33l-.06.06a2 2 0 11-2.83-2.83l.06-.06a1.65 1.65 0 00.33-1.82 1.65 1.65 0 00-1.51-1H3a2 2 0 110-4h.09A1.65 1.65 0 004.6 9a1.65 1.65 0 00-.33-1.82l-.06-.06a2 2 0 112.83-2.83l.06.06a1.65 1.65 0 001.82.33H9a1.65 1.65 0 001-1.51V3a2 2 0 114 0v.09a1.65 1.65 0 001 1.51 1.65 1.65 0 001.82-.33l.06-.06a2 2 0 112.83 2.83l-.06.06a1.65 1.65 0 00-.33 1.82V9a1.65 1.65 0 001.51 1H21a2 2 0 110 4h-.09a1.65 1.65 0 00-1.51 1z',
+      Bank: 'M3 21h18 M3 10h18 M5 6l7-3 7 3 M4 10v11 M20 10v11 M8 14v3 M12 14v3 M16 14v3',
+      Receipt: 'M4 2v20l2-1 2 1 2-1 2 1 2-1 2 1 2-1 2 1V2l-2 1-2-1-2 1-2-1-2 1-2-1-2 1-2-1z M16 8H8 M16 12H8 M13 16H8',
+      X: 'M18 6L6 18 M6 6l12 12',
+      Menu: 'M3 12h18 M3 6h18 M3 18h18',
+      Check: 'M20 6L9 17l-5-5',
+      Edit: 'M11 4H4a2 2 0 00-2 2v14a2 2 0 002 2h14a2 2 0 002-2v-7 M18.5 2.5a2.121 2.121 0 113 3L12 15l-4 1 1-4 9.5-9.5z',
+      AlertTriangle: 'M10.29 3.86L1.82 18a2 2 0 001.71 3h16.94a2 2 0 001.71-3L13.71 3.86a2 2 0 00-3.42 0z M12 9v4 M12 17h.01',
+      Copy: 'M20 9h-9a2 2 0 00-2 2v9a2 2 0 002 2h9a2 2 0 002-2v-9a2 2 0 00-2-2z M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1'
+    };
+    var Icon = function Icon(_ref) {
+      var name = _ref.name,
+        _ref$size = _ref.size,
+        size = _ref$size === void 0 ? 16 : _ref$size,
+        _ref$className = _ref.className,
+        className = _ref$className === void 0 ? '' : _ref$className,
+        props = _objectWithoutProperties(_ref, _excluded);
+      var path = ICONS[name];
+      if (!path) return null;
+      return React.createElement('svg', _objectSpread({
+        xmlns: 'http://www.w3.org/2000/svg',
+        width: size,
+        height: size,
+        viewBox: '0 0 24 24',
+        fill: 'none',
+        stroke: 'currentColor',
+        strokeWidth: 2,
+        strokeLinecap: 'round',
+        strokeLinejoin: 'round',
+        className: className
+      }, props), path.split(' M').map(function (segment, i) {
+        return React.createElement('path', {
+          key: i,
+          d: i === 0 ? segment : 'M' + segment
+        });
+      }));
+    };
+    
+    // ===== Constants =====
+    var INCOME_CATS = ['クロス張替', 'クロス張替・CF', 'クロス張替・網戸交換', 'ドア補修', 'ドア張替え', '扉補修', '穴補修', 'カーペット', '網戸交換', 'その他工事'];
+    var EXPENSE_CATS = ['材料費', '販売手数料', '地代家賃', '車両費', '専門サービス費', '租税公課', '雑費', '広告宣伝費', '通信費', '水道光熱費', '消耗品費', '旅費交通費', '会議費', '接待交際費', '保険料', '修繕費', '外注費', '給料賃金', '法定福利費', '減価償却費'];
+    var PAYMENTS = ['現金', '法人口座振り込み', 'プラットフォーム入金', 'コンビニ支払い', '口座振替（自動引落）', 'ゆうちょ支払い', 'クレジットカード', 'PayPay'];
+    var INVOICE_STATUS = ['無し', '見積書発行済み', '請求書発行済み', '領収書発行済み', '請求書・領収書発行済み'];
+    var PLATFORMS = ['暮らしマーケット', 'ゼヒトモ', 'line', 'wechat', 'dynast合同会社', 'K-carve life 株式会社', '直接受注', 'その他'];
+    
+    // ===== Helpers =====
+    var yen = function yen(n) {
+      return '¥' + Math.round(n || 0).toLocaleString('ja-JP');
+    };
+    var yenShort = function yenShort(n) {
+      if (!n) return '¥0';
+      var v = Math.abs(n);
+      var sign = n < 0 ? '-' : '';
+      if (v >= 10000000) return sign + '¥' + (v / 10000).toFixed(0) + '万';
+      if (v >= 10000) return sign + '¥' + (v / 10000).toFixed(1) + '万';
+      return sign + '¥' + v.toLocaleString();
+    };
+    var today = function today() {
+      return new Date().toISOString().slice(0, 10);
+    };
+    var monthOf = function monthOf(d) {
+      return d ? d.slice(0, 7) : '';
+    };
+    var daysSince = function daysSince(d) {
+      return !d ? 0 : Math.floor((Date.now() - new Date(d).getTime()) / 86400000);
+    };
+    var salesStatus = function salesStatus(s) {
+      if (!s.payment) return '確認中';
+      if (['現金', 'プラットフォーム入金', 'コンビニ支払い'].includes(s.payment)) return '入金済';
+      if (s.payment === '法人口座振り込み') {
+        if (['領収書発行済み', '請求書・領収書発行済み'].includes(s.invoiceStatus)) return '入金済';
+        if (['請求書発行済み', '見積書発行済み'].includes(s.invoiceStatus)) return '売掛金';
+      }
+      return '確認中';
+    };
+    var expStatus = function expStatus(e) {
+      if (!e.payment) return '確認中';
+      if (['現金', 'コンビニ支払い', 'ゆうちょ支払い', '口座振替（自動引落）', 'クレジットカード'].includes(e.payment)) return '支払済';
+      if (e.payment === '法人口座振り込み') {
+        if (['領収書発行済み', '請求書・領収書発行済み'].includes(e.invoiceStatus)) return '支払済';
+        if (['請求書発行済み', '見積書発行済み'].includes(e.invoiceStatus)) return '買掛金';
+      }
+      return '確認中';
+    };
+    
+    // ===== Initial data =====
+    var INITIAL_DATA = JSON.parse("{\"sales\":[{\"id\":\"s1\",\"date\":\"2025-10-01\",\"category\":\"\u30AF\u30ED\u30B9\u5F35\u66FF\",\"content\":\"\u65B0\u5BBF\",\"amount\":116000,\"payment\":\"\u6CD5\u4EBA\u53E3\u5EA7\u632F\u308A\u8FBC\u307F\",\"invoiceStatus\":\"\u8ACB\u6C42\u66F8\u767A\u884C\u6E08\u307F\",\"platform\":\"line\",\"note\":\"\",\"voucherNo\":\"\",\"fileName\":\"\"},{\"id\":\"s2\",\"date\":\"2025-10-02\",\"category\":\"\u30AF\u30ED\u30B9\u5F35\u66FF\",\"content\":\"\u76EE\u9ED2\u3001\u6E05\u6383\u4E00\u7DD2\",\"amount\":110000,\"payment\":\"\u73FE\u91D1\",\"invoiceStatus\":\"\u9818\u53CE\u66F8\u767A\u884C\u305A\u307F\",\"platform\":\"\u66AE\u3089\u3057\u30DE\u30FC\u30B1\u30C3\u30C8\",\"note\":\"\",\"voucherNo\":\"\",\"fileName\":\"\"},{\"id\":\"s3\",\"date\":\"2025-10-06\",\"category\":\"\u30C9\u30A2\u88DC\u4FEE\",\"content\":\"\u677F\u6A4B\",\"amount\":34000,\"payment\":\"\u73FE\u91D1\",\"invoiceStatus\":\"\u7121\u3057\",\"platform\":\"\u66AE\u3089\u3057\u30DE\u30FC\u30B1\u30C3\u30C8\",\"note\":\"\",\"voucherNo\":\"\",\"fileName\":\"\"},{\"id\":\"s4\",\"date\":\"2025-10-14\",\"category\":\"\u30AF\u30ED\u30B9\u5F35\u66FF\",\"content\":\"\u592A\u7530\u533A\",\"amount\":69000,\"payment\":\"\u73FE\u91D1\",\"invoiceStatus\":\"\u7121\u3057\",\"platform\":\"\u66AE\u3089\u3057\u30DE\u30FC\u30B1\u30C3\u30C8\",\"note\":\"\",\"voucherNo\":\"\",\"fileName\":\"\"},{\"id\":\"s5\",\"date\":\"2025-10-15\",\"category\":\"\u30AF\u30ED\u30B9\u5F35\u66FF\",\"content\":\"\u7DF4\u99AC\",\"amount\":281864,\"payment\":\"\u6CD5\u4EBA\u53E3\u5EA7\u632F\u308A\u8FBC\u307F\",\"invoiceStatus\":\"\u8ACB\u6C42\u66F8\u767A\u884C\u6E08\u307F\",\"platform\":\"\u66AE\u3089\u3057\u30DE\u30FC\u30B1\u30C3\u30C8\",\"note\":\"\",\"voucherNo\":\"\",\"fileName\":\"\"},{\"id\":\"s6\",\"date\":\"2025-10-19\",\"category\":\"\u30AF\u30ED\u30B9\u5F35\u66FF\",\"content\":\"\u5927\u7530\u533A\",\"amount\":24000,\"payment\":\"\u73FE\u91D1\",\"invoiceStatus\":\"\u7121\u3057\",\"platform\":\"\u66AE\u3089\u3057\u30DE\u30FC\u30B1\u30C3\u30C8\",\"note\":\"\",\"voucherNo\":\"\",\"fileName\":\"\"},{\"id\":\"s7\",\"date\":\"2025-10-22\",\"category\":\"\u30AF\u30ED\u30B9\u5F35\u66FF\",\"content\":\"\u65B0\u5BBF\",\"amount\":18000,\"payment\":\"\u73FE\u91D1\",\"invoiceStatus\":\"\u7121\u3057\",\"platform\":\"\u66AE\u3089\u3057\u30DE\u30FC\u30B1\u30C3\u30C8\",\"note\":\"\",\"voucherNo\":\"\",\"fileName\":\"\"},{\"id\":\"s8\",\"date\":\"2025-10-23\",\"category\":\"\u30AF\u30ED\u30B9\u5F35\u66FF\",\"content\":\"\u53F0\u6771\u533A\",\"amount\":150000,\"payment\":\"\u6CD5\u4EBA\u53E3\u5EA7\u632F\u308A\u8FBC\u307F\",\"invoiceStatus\":\"\u898B\u7A4D\u66F8\u767A\u884C\u6E08\u307F\",\"platform\":\"\u66AE\u3089\u3057\u30DE\u30FC\u30B1\u30C3\u30C8\",\"note\":\"\",\"voucherNo\":\"\",\"fileName\":\"\"},{\"id\":\"s9\",\"date\":\"2025-10-25\",\"category\":\"\u30AF\u30ED\u30B9\u5F35\u66FF\",\"content\":\"\u677F\u6A4B\u533A\",\"amount\":37000,\"payment\":\"\u30D7\u30E9\u30C3\u30C8\u30D5\u30A9\u30FC\u30E0\u5165\u91D1\",\"invoiceStatus\":\"\u7121\u3057\",\"platform\":\"\u66AE\u3089\u3057\u30DE\u30FC\u30B1\u30C3\u30C8\",\"note\":\"\",\"voucherNo\":\"\",\"fileName\":\"\"},{\"id\":\"s10\",\"date\":\"2025-10-28\",\"category\":\"\u30AF\u30ED\u30B9\u5F35\u66FF\",\"content\":\"\u65B0\u5BBF\u533A\",\"amount\":40000,\"payment\":\"\u73FE\u91D1\",\"invoiceStatus\":\"\u9818\u53CE\u66F8\u767A\u884C\u305A\u307F\",\"platform\":\"\u66AE\u3089\u3057\u30DE\u30FC\u30B1\u30C3\u30C8\",\"note\":\"\",\"voucherNo\":\"\",\"fileName\":\"\"},{\"id\":\"s11\",\"date\":\"2025-10-28\",\"category\":\"\u30AF\u30ED\u30B9\u5F35\u66FF\",\"content\":\"\u65B0\u5BBF\u843D\u5408\",\"amount\":108000,\"payment\":\"\u73FE\u91D1\",\"invoiceStatus\":\"\u7121\u3057\",\"platform\":\"\u66AE\u3089\u3057\u30DE\u30FC\u30B1\u30C3\u30C8\",\"note\":\"\",\"voucherNo\":\"\",\"fileName\":\"\"},{\"id\":\"s12\",\"date\":\"2025-10-30\",\"category\":\"\u30AF\u30ED\u30B9\u5F35\u66FF\",\"content\":\"\u76EE\u9ED2\",\"amount\":274478,\"payment\":\"\u73FE\u91D1\",\"invoiceStatus\":\"\u8ACB\u6C42\u66F8\u767A\u884C\u6E08\u307F\",\"platform\":\"\u66AE\u3089\u3057\u30DE\u30FC\u30B1\u30C3\u30C8\",\"note\":\"\",\"voucherNo\":\"\",\"fileName\":\"\"},{\"id\":\"s13\",\"date\":\"2025-10-31\",\"category\":\"\u30AF\u30ED\u30B9\u5F35\u66FF\",\"content\":\"\u65B0\u5BBFk-life\",\"amount\":173195,\"payment\":\"\u6CD5\u4EBA\u53E3\u5EA7\u632F\u308A\u8FBC\u307F\",\"invoiceStatus\":\"\u8ACB\u6C42\u66F8\u767A\u884C\u6E08\u307F\",\"platform\":\"wechat\",\"note\":\"\",\"voucherNo\":\"\",\"fileName\":\"\"},{\"id\":\"s14\",\"date\":\"2025-10-31\",\"category\":\"\u30AF\u30ED\u30B9\u5F35\u66FF\",\"content\":\"\u76EE\u9ED2\",\"amount\":24000,\"payment\":\"\u73FE\u91D1\",\"invoiceStatus\":\"\u7121\u3057\",\"platform\":\"\u66AE\u3089\u3057\u30DE\u30FC\u30B1\u30C3\u30C8\",\"note\":\"\",\"voucherNo\":\"\",\"fileName\":\"\"},{\"id\":\"s15\",\"date\":\"2025-10-31\",\"category\":\"\u30AF\u30ED\u30B9\u5F35\u66FF\",\"content\":\"dynast\u5408\u540C\u4F1A\u793E \u2003\",\"amount\":286766,\"payment\":\"\u6CD5\u4EBA\u53E3\u5EA7\u632F\u308A\u8FBC\u307F\",\"invoiceStatus\":\"\u8ACB\u6C42\u66F8\u767A\u884C\u6E08\u307F\",\"platform\":\"dynast\u5408\u540C\u4F1A\u793E\",\"note\":\"\",\"voucherNo\":\"\",\"fileName\":\"\"},{\"id\":\"s16\",\"date\":\"2025-11-01\",\"category\":\"\u30AF\u30ED\u30B9\u5F35\u66FF\",\"content\":\"\u4E2D\u592E\u533A\",\"amount\":54000,\"payment\":\"\u73FE\u91D1\",\"invoiceStatus\":\"\u9818\u53CE\u66F8\u767A\u884C\u305A\u307F\",\"platform\":\"\u66AE\u3089\u3057\u30DE\u30FC\u30B1\u30C3\u30C8\",\"note\":\"\",\"voucherNo\":\"\",\"fileName\":\"\"},{\"id\":\"s17\",\"date\":\"2025-11-05\",\"category\":\"\u30AF\u30ED\u30B9\u5F35\u66FF\",\"content\":\"\u845B\u98FE\",\"amount\":62000,\"payment\":\"\u6CD5\u4EBA\u53E3\u5EA7\u632F\u308A\u8FBC\u307F\",\"invoiceStatus\":\"\u7121\u3057\",\"platform\":\"\u66AE\u3089\u3057\u30DE\u30FC\u30B1\u30C3\u30C8\",\"note\":\"\",\"voucherNo\":\"\",\"fileName\":\"\"},{\"id\":\"s18\",\"date\":\"2025-11-05\",\"category\":\"\u30AF\u30ED\u30B9\u5F35\u66FF\",\"content\":\"\u53F0\u6771\u533Ak-life\",\"amount\":22000,\"payment\":\"\u6CD5\u4EBA\u53E3\u5EA7\u632F\u308A\u8FBC\u307F\",\"invoiceStatus\":\"\u8ACB\u6C42\u66F8\u767A\u884C\u6E08\u307F\",\"platform\":\"wechat\",\"note\":\"\",\"voucherNo\":\"\",\"fileName\":\"\"},{\"id\":\"s19\",\"date\":\"2025-11-06\",\"category\":\"\u30AF\u30ED\u30B9\u5F35\u66FF\",\"content\":\"\u6E2F\u533A\",\"amount\":10000,\"payment\":\"\u6CD5\u4EBA\u53E3\u5EA7\u632F\u308A\u8FBC\u307F\",\"invoiceStatus\":\"\u9818\u53CE\u66F8\u767A\u884C\u305A\u307F\",\"platform\":\"\u66AE\u3089\u3057\u30DE\u30FC\u30B1\u30C3\u30C8\",\"note\":\"\",\"voucherNo\":\"\",\"fileName\":\"\"},{\"id\":\"s20\",\"date\":\"2025-11-08\",\"category\":\"\u30AF\u30ED\u30B9\u5F35\u66FF\",\"content\":\"\u4E2D\u592E\u533A\",\"amount\":18000,\"payment\":\"\u73FE\u91D1\",\"invoiceStatus\":\"\u7121\u3057\",\"platform\":\"\u66AE\u3089\u3057\u30DE\u30FC\u30B1\u30C3\u30C8\",\"note\":\"\",\"voucherNo\":\"\",\"fileName\":\"\"},{\"id\":\"s21\",\"date\":\"2025-11-09\",\"category\":\"\u30AF\u30ED\u30B9\u5F35\u66FF\",\"content\":\"\u6E0B\u8C37\",\"amount\":37000,\"payment\":\"\u73FE\u91D1\",\"invoiceStatus\":\"\u7121\u3057\",\"platform\":\"\u66AE\u3089\u3057\u30DE\u30FC\u30B1\u30C3\u30C8\",\"note\":\"\",\"voucherNo\":\"\",\"fileName\":\"\"},{\"id\":\"s22\",\"date\":\"2025-11-10\",\"category\":\"\u30AF\u30ED\u30B9\u5F35\u66FF\",\"content\":\"\u53F0\u6771\u533Ak-life\",\"amount\":87516,\"payment\":\"\u6CD5\u4EBA\u53E3\u5EA7\u632F\u308A\u8FBC\u307F\",\"invoiceStatus\":\"\u8ACB\u6C42\u66F8\u767A\u884C\u6E08\u307F\",\"platform\":\"wechat\",\"note\":\"\",\"voucherNo\":\"\",\"fileName\":\"\"},{\"id\":\"s23\",\"date\":\"2025-11-11\",\"category\":\"\u30C9\u30A2\u88DC\u4FEE\",\"content\":\"\u58A8\u7530\u533A\",\"amount\":68000,\"payment\":\"\u73FE\u91D1\",\"invoiceStatus\":\"\u7121\u3057\",\"platform\":\"\u66AE\u3089\u3057\u30DE\u30FC\u30B1\u30C3\u30C8\",\"note\":\"\",\"voucherNo\":\"\",\"fileName\":\"\"},{\"id\":\"s24\",\"date\":\"2025-11-11\",\"category\":\"\u30AF\u30ED\u30B9\u5F35\u66FF\",\"content\":\"\u6E2F\u533A\",\"amount\":98000,\"payment\":\"\u73FE\u91D1\",\"invoiceStatus\":\"\u7121\u3057\",\"platform\":\"\u66AE\u3089\u3057\u30DE\u30FC\u30B1\u30C3\u30C8\",\"note\":\"\",\"voucherNo\":\"\",\"fileName\":\"\"},{\"id\":\"s25\",\"date\":\"2025-11-12\",\"category\":\"\u30AF\u30ED\u30B9\u5F35\u66FF\",\"content\":\"\u65B0\u5BBF\",\"amount\":71000,\"payment\":\"\u73FE\u91D1\",\"invoiceStatus\":\"\u9818\u53CE\u66F8\u767A\u884C\u6E08\u307F\",\"platform\":\"\u66AE\u3089\u3057\u30DE\u30FC\u30B1\u30C3\u30C8\",\"note\":\"\",\"voucherNo\":\"\",\"fileName\":\"\"},{\"id\":\"s26\",\"date\":\"2025-11-14\",\"category\":\"\u30AF\u30ED\u30B9\u5F35\u66FF\",\"content\":\"\u6D45\u8349\",\"amount\":195074,\"payment\":\"\u6CD5\u4EBA\u53E3\u5EA7\u632F\u308A\u8FBC\u307F\",\"invoiceStatus\":\"\u7121\u3057\",\"platform\":\"\u66AE\u3089\u3057\u30DE\u30FC\u30B1\u30C3\u30C8\",\"note\":\"\",\"voucherNo\":\"\",\"fileName\":\"\"},{\"id\":\"s27\",\"date\":\"2025-11-15\",\"category\":\"\u30AF\u30ED\u30B9\u5F35\u66FF\",\"content\":\"\u58A8\u7530\u533A\",\"amount\":39000,\"payment\":\"\u30D7\u30E9\u30C3\u30C8\u30D5\u30A9\u30FC\u30E0\u5165\u91D1\",\"invoiceStatus\":\"\u7121\u3057\",\"platform\":\"\u66AE\u3089\u3057\u30DE\u30FC\u30B1\u30C3\u30C8\",\"note\":\"\",\"voucherNo\":\"\",\"fileName\":\"\"},{\"id\":\"s28\",\"date\":\"2025-11-16\",\"category\":\"\u30AF\u30ED\u30B9\u5F35\u66FF\",\"content\":\"\u8C4A\u5CF6\u533A\",\"amount\":70000,\"payment\":\"\u6CD5\u4EBA\u53E3\u5EA7\u632F\u308A\u8FBC\u307F\",\"invoiceStatus\":\"\u7121\u3057\",\"platform\":\"\u66AE\u3089\u3057\u30DE\u30FC\u30B1\u30C3\u30C8\",\"note\":\"\",\"voucherNo\":\"\",\"fileName\":\"\"},{\"id\":\"s29\",\"date\":\"2025-11-18\",\"category\":\"\u7A74\u88DC\u4FEE\",\"content\":\"\u6E0B\u8C37\",\"amount\":37000,\"payment\":\"\u30D7\u30E9\u30C3\u30C8\u30D5\u30A9\u30FC\u30E0\u5165\u91D1\",\"invoiceStatus\":\"\u7121\u3057\",\"platform\":\"\u66AE\u3089\u3057\u30DE\u30FC\u30B1\u30C3\u30C8\",\"note\":\"\",\"voucherNo\":\"\",\"fileName\":\"\"},{\"id\":\"s30\",\"date\":\"2025-11-18\",\"category\":\"\u30AF\u30ED\u30B9\u5F35\u66FF\",\"content\":\"\u6587\u4EAC\u533A\",\"amount\":22000,\"payment\":\"\u6CD5\u4EBA\u53E3\u5EA7\u632F\u308A\u8FBC\u307F\",\"invoiceStatus\":\"\u7121\u3057\",\"platform\":\"\u66AE\u3089\u3057\u30DE\u30FC\u30B1\u30C3\u30C8\",\"note\":\"\",\"voucherNo\":\"\",\"fileName\":\"\"},{\"id\":\"s31\",\"date\":\"2025-11-18\",\"category\":\"\u30C9\u30A2\u5F35\u66FF\u3048\",\"content\":\"\u9326\u7CF8\u753A\",\"amount\":67000,\"payment\":\"\u73FE\u91D1\",\"invoiceStatus\":\"\u7121\u3057\",\"platform\":\"\u66AE\u3089\u3057\u30DE\u30FC\u30B1\u30C3\u30C8\",\"note\":\"\",\"voucherNo\":\"\",\"fileName\":\"\"},{\"id\":\"s32\",\"date\":\"2025-11-19\",\"category\":\"\u30C9\u30A2\u88DC\u4FEE\",\"content\":\"\u6749\u4E26\u533A\",\"amount\":34000,\"payment\":\"\u73FE\u91D1\",\"invoiceStatus\":\"\u7121\u3057\",\"platform\":\"\u66AE\u3089\u3057\u30DE\u30FC\u30B1\u30C3\u30C8\",\"note\":\"\",\"voucherNo\":\"\",\"fileName\":\"\"},{\"id\":\"s33\",\"date\":\"2025-11-22\",\"category\":\"\u30AF\u30ED\u30B9\u5F35\u66FF\",\"content\":\"\u6674\u6D77\",\"amount\":237000,\"payment\":\"\u6CD5\u4EBA\u53E3\u5EA7\u632F\u308A\u8FBC\u307F\",\"invoiceStatus\":\"\u7121\u3057\",\"platform\":\"\u66AE\u3089\u3057\u30DE\u30FC\u30B1\u30C3\u30C8\",\"note\":\"\",\"voucherNo\":\"\",\"fileName\":\"\"},{\"id\":\"s34\",\"date\":\"2025-11-23\",\"category\":\"\u305D\u306E\u4ED6\u5DE5\u4E8B\",\"content\":\"\u30AF\u30ED\u30B9\u30FB\u6249\u5F35\u66FF\u6E2F\u533A\",\"amount\":395000,\"payment\":\"\u6CD5\u4EBA\u53E3\u5EA7\u632F\u308A\u8FBC\u307F\",\"invoiceStatus\":\"\u9818\u53CE\u66F8\u767A\u884C\u6E08\u307F\",\"platform\":\"\u66AE\u3089\u3057\u30DE\u30FC\u30B1\u30C3\u30C8\",\"note\":\"\",\"voucherNo\":\"\",\"fileName\":\"\"},{\"id\":\"s35\",\"date\":\"2025-11-25\",\"category\":\"\u30AF\u30ED\u30B9\u5F35\u66FF\",\"content\":\"\u58A8\u7530\u533A\",\"amount\":135300,\"payment\":\"\u73FE\u91D1\",\"invoiceStatus\":\"\u9818\u53CE\u66F8\u767A\u884C\u6E08\u307F\",\"platform\":\"\u66AE\u3089\u3057\u30DE\u30FC\u30B1\u30C3\u30C8\",\"note\":\"\",\"voucherNo\":\"\",\"fileName\":\"\"},{\"id\":\"s36\",\"date\":\"2025-11-27\",\"category\":\"\u30AF\u30ED\u30B9\u5F35\u66FF\",\"content\":\"\u5317\u533A\",\"amount\":24000,\"payment\":\"\u73FE\u91D1\",\"invoiceStatus\":\"\u9818\u53CE\u66F8\u767A\u884C\u6E08\u307F\",\"platform\":\"\u30BC\u30D2\u30C8\u30E2\",\"note\":\"\",\"voucherNo\":\"\",\"fileName\":\"\"},{\"id\":\"s37\",\"date\":\"2025-11-27\",\"category\":\"\u30AF\u30ED\u30B9\u5F35\u66FF\",\"content\":\"\u8352\u5DDD\",\"amount\":93000,\"payment\":\"\",\"invoiceStatus\":\"\",\"platform\":\"\u66AE\u3089\u3057\u30DE\u30FC\u30B1\u30C3\u30C8\",\"note\":\"\",\"voucherNo\":\"\",\"fileName\":\"\"},{\"id\":\"s38\",\"date\":\"2025-11-28\",\"category\":\"\u30AF\u30ED\u30B9\u5F35\u66FF\",\"content\":\"\u4E16\u7530\u8C37\",\"amount\":13000,\"payment\":\"\",\"invoiceStatus\":\"\",\"platform\":\"\u66AE\u3089\u3057\u30DE\u30FC\u30B1\u30C3\u30C8\",\"note\":\"\",\"voucherNo\":\"\",\"fileName\":\"\"},{\"id\":\"s39\",\"date\":\"2025-11-28\",\"category\":\"\u30AF\u30ED\u30B9\u5F35\u66FF\",\"content\":\"\u6E2F\u533A\",\"amount\":25000,\"payment\":\"\",\"invoiceStatus\":\"\",\"platform\":\"\u66AE\u3089\u3057\u30DE\u30FC\u30B1\u30C3\u30C8\",\"note\":\"\",\"voucherNo\":\"\",\"fileName\":\"\"},{\"id\":\"s40\",\"date\":\"2025-11-29\",\"category\":\"\u30AF\u30ED\u30B9\u5F35\u66FF\",\"content\":\"\u52DD\u3069\u304D\",\"amount\":346640,\"payment\":\"\",\"invoiceStatus\":\"\u9818\u53CE\u66F8\u767A\u884C\u6E08\u307F\",\"platform\":\"\u66AE\u3089\u3057\u30DE\u30FC\u30B1\u30C3\u30C8\",\"note\":\"\",\"voucherNo\":\"\",\"fileName\":\"\"},{\"id\":\"s41\",\"date\":\"2025-11-30\",\"category\":\"\u30AF\u30ED\u30B9\u5F35\u66FF\",\"content\":\"dynast\u5408\u540C\u4F1A\u793E \u2003\",\"amount\":474343,\"payment\":\"\u6CD5\u4EBA\u53E3\u5EA7\u632F\u308A\u8FBC\u307F\",\"invoiceStatus\":\"\u8ACB\u6C42\u66F8\u767A\u884C\u6E08\u307F\",\"platform\":\"dynast\u5408\u540C\u4F1A\u793E\",\"note\":\"\",\"voucherNo\":\"\",\"fileName\":\"\"},{\"id\":\"s42\",\"date\":\"2025-12-02\",\"category\":\"\u30AF\u30ED\u30B9\u5F35\u66FF\",\"content\":\"\u4E16\u7530\u8C37\u533A\",\"amount\":155000,\"payment\":\"\",\"invoiceStatus\":\"\",\"platform\":\"\u66AE\u3089\u3057\u30DE\u30FC\u30B1\u30C3\u30C8\",\"note\":\"\",\"voucherNo\":\"\",\"fileName\":\"\"},{\"id\":\"s43\",\"date\":\"2025-12-05\",\"category\":\"\u30AF\u30ED\u30B9\u5F35\u66FF\",\"content\":\"\u7DF4\u99AC\u533A\",\"amount\":16000,\"payment\":\"\u73FE\u91D1\",\"invoiceStatus\":\"\u7121\u3057\",\"platform\":\"\u66AE\u3089\u3057\u30DE\u30FC\u30B1\u30C3\u30C8\",\"note\":\"\",\"voucherNo\":\"\",\"fileName\":\"\"},{\"id\":\"s44\",\"date\":\"2025-12-06\",\"category\":\"\u30AF\u30ED\u30B9\u5F35\u66FF\",\"content\":\"\u8C4A\u5CF6\u533A\",\"amount\":59000,\"payment\":\"\",\"invoiceStatus\":\"\",\"platform\":\"\u66AE\u3089\u3057\u30DE\u30FC\u30B1\u30C3\u30C8\",\"note\":\"\",\"voucherNo\":\"\",\"fileName\":\"\"},{\"id\":\"s45\",\"date\":\"2025-12-06\",\"category\":\"\u30AF\u30ED\u30B9\u5F35\u66FF\",\"content\":\"\u6C60\u888B\",\"amount\":115000,\"payment\":\"\",\"invoiceStatus\":\"\",\"platform\":\"\u66AE\u3089\u3057\u30DE\u30FC\u30B1\u30C3\u30C8\",\"note\":\"\",\"voucherNo\":\"\",\"fileName\":\"\"},{\"id\":\"s46\",\"date\":\"2025-12-11\",\"category\":\"\u30C9\u30A2\u88DC\u4FEE\",\"content\":\"\u4E2D\u91CE\",\"amount\":49000,\"payment\":\"\u30D7\u30E9\u30C3\u30C8\u30D5\u30A9\u30FC\u30E0\u5165\u91D1\",\"invoiceStatus\":\"\u7121\u3057\",\"platform\":\"\u66AE\u3089\u3057\u30DE\u30FC\u30B1\u30C3\u30C8\",\"note\":\"\",\"voucherNo\":\"\",\"fileName\":\"\"},{\"id\":\"s47\",\"date\":\"2025-12-11\",\"category\":\"\u305D\u306E\u4ED6\u5DE5\u4E8B\",\"content\":\"\u30AF\u30ED\u30B9\u5F35\u66FF\u30FB\u7DB2\u6238\u8DB3\u7ACB\",\"amount\":100000,\"payment\":\"\",\"invoiceStatus\":\"\",\"platform\":\"\u66AE\u3089\u3057\u30DE\u30FC\u30B1\u30C3\u30C8\",\"note\":\"\",\"voucherNo\":\"\",\"fileName\":\"\"},{\"id\":\"s48\",\"date\":\"2025-12-13\",\"category\":\"\u30C9\u30A2\u88DC\u4FEE\",\"content\":\"\u6749\u4E26\u533A\",\"amount\":178000,\"payment\":\"\u73FE\u91D1\",\"invoiceStatus\":\"\u7121\u3057\",\"platform\":\"\u66AE\u3089\u3057\u30DE\u30FC\u30B1\u30C3\u30C8\",\"note\":\"\",\"voucherNo\":\"\",\"fileName\":\"\"},{\"id\":\"s49\",\"date\":\"2025-12-14\",\"category\":\"\u7A74\u88DC\u4FEE\",\"content\":\"\u5343\u8449\",\"amount\":77000,\"payment\":\"\u73FE\u91D1\",\"invoiceStatus\":\"\u9818\u53CE\u66F8\u767A\u884C\u6E08\u307F\",\"platform\":\"wechat\",\"note\":\"\",\"voucherNo\":\"\",\"fileName\":\"\"},{\"id\":\"s50\",\"date\":\"2025-12-18\",\"category\":\"\u305D\u306E\u4ED6\u5DE5\u4E8B\",\"content\":\"\u30AF\u30ED\u30B9\u30FB\u30AF\u30C3\u30B7\u30E7\u30F3\u30D5\u30ED\u30A2\u5F35\u66FF\u4E2D\u91CE\",\"amount\":184000,\"payment\":\"\",\"invoiceStatus\":\"\u9818\u53CE\u66F8\u767A\u884C\u6E08\u307F\",\"platform\":\"\u66AE\u3089\u3057\u30DE\u30FC\u30B1\u30C3\u30C8\",\"note\":\"\",\"voucherNo\":\"\",\"fileName\":\"\"},{\"id\":\"s51\",\"date\":\"2025-12-19\",\"category\":\"\u305D\u306E\u4ED6\u5DE5\u4E8B\",\"content\":\"\u30AF\u30ED\u30B9\u30FB\u30AB\u30FC\u30DA\u30C3\u30C8\u5F35\u66FF\u5927\u585A\",\"amount\":67980,\"payment\":\"\",\"invoiceStatus\":\"\u9818\u53CE\u66F8\u767A\u884C\u6E08\u307F\",\"platform\":\"\u66AE\u3089\u3057\u30DE\u30FC\u30B1\u30C3\u30C8\",\"note\":\"\",\"voucherNo\":\"\",\"fileName\":\"\"},{\"id\":\"s52\",\"date\":\"2025-12-20\",\"category\":\"\u30AF\u30ED\u30B9\u5F35\u66FF\",\"content\":\"\u4E2D\u91CE\",\"amount\":45000,\"payment\":\"\",\"invoiceStatus\":\"\",\"platform\":\"\u66AE\u3089\u3057\u30DE\u30FC\u30B1\u30C3\u30C8\",\"note\":\"\",\"voucherNo\":\"\",\"fileName\":\"\"},{\"id\":\"s53\",\"date\":\"2025-12-23\",\"category\":\"\u30AF\u30ED\u30B9\u5F35\u66FF\",\"content\":\"\u4E16\u7530\u8C37\",\"amount\":72000,\"payment\":\"\",\"invoiceStatus\":\"\",\"platform\":\"\u66AE\u3089\u3057\u30DE\u30FC\u30B1\u30C3\u30C8\",\"note\":\"\",\"voucherNo\":\"\",\"fileName\":\"\"},{\"id\":\"s54\",\"date\":\"2025-12-24\",\"category\":\"\u30AF\u30ED\u30B9\u5F35\u66FF\",\"content\":\"\u4E16\u7530\u8C37\",\"amount\":202235,\"payment\":\"\",\"invoiceStatus\":\"\u8ACB\u6C42\u66F8\u767A\u884C\u6E08\u307F\",\"platform\":\"line\",\"note\":\"\",\"voucherNo\":\"\",\"fileName\":\"\"},{\"id\":\"s55\",\"date\":\"2025-12-25\",\"category\":\"\u30AF\u30ED\u30B9\u5F35\u66FF\",\"content\":\"\u8DB3\u7ACB\u533A\",\"amount\":249000,\"payment\":\"\",\"invoiceStatus\":\"\",\"platform\":\"\u66AE\u3089\u3057\u30DE\u30FC\u30B1\u30C3\u30C8\",\"note\":\"\",\"voucherNo\":\"\",\"fileName\":\"\"},{\"id\":\"s56\",\"date\":\"2025-12-27\",\"category\":\"\u7A74\u88DC\u4FEE\",\"content\":\"\u677F\u6A4B\u533A\",\"amount\":39000,\"payment\":\"\u73FE\u91D1\",\"invoiceStatus\":\"\",\"platform\":\"\u66AE\u3089\u3057\u30DE\u30FC\u30B1\u30C3\u30C8\",\"note\":\"\",\"voucherNo\":\"\",\"fileName\":\"\"},{\"id\":\"s57\",\"date\":\"2025-12-27\",\"category\":\"\u30C9\u30A2\u88DC\u4FEE\",\"content\":\"\u8C4A\u5CF6\u533A\",\"amount\":34000,\"payment\":\"\u30D7\u30E9\u30C3\u30C8\u30D5\u30A9\u30FC\u30E0\u5165\u91D1\",\"invoiceStatus\":\"\",\"platform\":\"\u66AE\u3089\u3057\u30DE\u30FC\u30B1\u30C3\u30C8\",\"note\":\"\",\"voucherNo\":\"\",\"fileName\":\"\"},{\"id\":\"s58\",\"date\":\"2025-12-30\",\"category\":\"\u30AF\u30ED\u30B9\u5F35\u66FF\",\"content\":\"dynast\u5408\u540C\u4F1A\u793E \u2003\",\"amount\":320642,\"payment\":\"\u6CD5\u4EBA\u53E3\u5EA7\u632F\u308A\u8FBC\u307F\",\"invoiceStatus\":\"\u8ACB\u6C42\u66F8\u767A\u884C\u6E08\u307F\",\"platform\":\"dynast\u5408\u540C\u4F1A\u793E\",\"note\":\"\",\"voucherNo\":\"\",\"fileName\":\"\"},{\"id\":\"s59\",\"date\":\"2026-01-04\",\"category\":\"\u30AF\u30ED\u30B9\u5F35\u66FF\",\"content\":\"\u53F0\u6771\u533A\",\"amount\":100000,\"payment\":\"\",\"invoiceStatus\":\"\",\"platform\":\"\",\"note\":\"\",\"voucherNo\":\"\",\"fileName\":\"\"},{\"id\":\"s60\",\"date\":\"2026-01-08\",\"category\":\"\u30AF\u30ED\u30B9\u5F35\u66FF\",\"content\":\"\u7DF4\u99AC\u533A\",\"amount\":105545,\"payment\":\"\",\"invoiceStatus\":\"\u9818\u53CE\u66F8\u767A\u884C\u6E08\u307F\",\"platform\":\"\u66AE\u3089\u3057\u30DE\u30FC\u30B1\u30C3\u30C8\",\"note\":\"\",\"voucherNo\":\"\",\"fileName\":\"\"},{\"id\":\"s61\",\"date\":\"2026-01-09\",\"category\":\"\u7A74\u88DC\u4FEE\",\"content\":\"\u4E2D\u91CE\",\"amount\":40000,\"payment\":\"\",\"invoiceStatus\":\"\",\"platform\":\"\u66AE\u3089\u3057\u30DE\u30FC\u30B1\u30C3\u30C8\",\"note\":\"\",\"voucherNo\":\"\",\"fileName\":\"\"},{\"id\":\"s62\",\"date\":\"2026-01-12\",\"category\":\"\u30AF\u30ED\u30B9\u5F35\u66FF\",\"content\":\"\u843D\u5408\",\"amount\":136000,\"payment\":\"\",\"invoiceStatus\":\"\",\"platform\":\"\u66AE\u3089\u3057\u30DE\u30FC\u30B1\u30C3\u30C8\",\"note\":\"\",\"voucherNo\":\"\",\"fileName\":\"\"},{\"id\":\"s63\",\"date\":\"2026-01-15\",\"category\":\"\u30AF\u30ED\u30B9\u5F35\u66FF\",\"content\":\"\u8C4A\u5CF6\u533A\",\"amount\":35000,\"payment\":\"\",\"invoiceStatus\":\"\",\"platform\":\"\u66AE\u3089\u3057\u30DE\u30FC\u30B1\u30C3\u30C8\",\"note\":\"\",\"voucherNo\":\"\",\"fileName\":\"\"},{\"id\":\"s64\",\"date\":\"2026-01-15\",\"category\":\"\u30C9\u30A2\u88DC\u4FEE\",\"content\":\"\u65B0\u5BBF\",\"amount\":35000,\"payment\":\"\",\"invoiceStatus\":\"\u9818\u53CE\u66F8\u767A\u884C\u6E08\u307F\",\"platform\":\"\u66AE\u3089\u3057\u30DE\u30FC\u30B1\u30C3\u30C8\",\"note\":\"\",\"voucherNo\":\"\",\"fileName\":\"\"},{\"id\":\"s65\",\"date\":\"2026-01-16\",\"category\":\"\u7A74\u88DC\u4FEE\",\"content\":\"\u6E2F\u533A\",\"amount\":60000,\"payment\":\"\",\"invoiceStatus\":\"\u9818\u53CE\u66F8\u767A\u884C\u6E08\u307F\",\"platform\":\"\u66AE\u3089\u3057\u30DE\u30FC\u30B1\u30C3\u30C8\",\"note\":\"\",\"voucherNo\":\"\",\"fileName\":\"\"},{\"id\":\"s66\",\"date\":\"2026-01-17\",\"category\":\"\u30AF\u30ED\u30B9\u5F35\u66FF\",\"content\":\"\u6E2F\u533A\",\"amount\":230000,\"payment\":\"\",\"invoiceStatus\":\"\",\"platform\":\"\u66AE\u3089\u3057\u30DE\u30FC\u30B1\u30C3\u30C8\",\"note\":\"\",\"voucherNo\":\"\",\"fileName\":\"\"},{\"id\":\"s67\",\"date\":\"2026-01-19\",\"category\":\"\u30AF\u30ED\u30B9\u5F35\u66FF\",\"content\":\"\u5357\u5343\u4F4F\",\"amount\":44000,\"payment\":\"\u6CD5\u4EBA\u53E3\u5EA7\u632F\u308A\u8FBC\u307F\",\"invoiceStatus\":\"\",\"platform\":\"\u66AE\u3089\u3057\u30DE\u30FC\u30B1\u30C3\u30C8\",\"note\":\"\",\"voucherNo\":\"\",\"fileName\":\"\"},{\"id\":\"s68\",\"date\":\"2026-01-21\",\"category\":\"\u30C9\u30A2\u88DC\u4FEE\",\"content\":\"\u4E2D\u91CE\",\"amount\":68000,\"payment\":\"\u73FE\u91D1\",\"invoiceStatus\":\"\",\"platform\":\"\u66AE\u3089\u3057\u30DE\u30FC\u30B1\u30C3\u30C8\",\"note\":\"\",\"voucherNo\":\"\",\"fileName\":\"\"},{\"id\":\"s69\",\"date\":\"2026-01-22\",\"category\":\"\u30C9\u30A2\u88DC\u4FEE\",\"content\":\"\u677F\u6A4B\u533A\",\"amount\":143000,\"payment\":\"\",\"invoiceStatus\":\"\",\"platform\":\"\u66AE\u3089\u3057\u30DE\u30FC\u30B1\u30C3\u30C8\",\"note\":\"\",\"voucherNo\":\"\",\"fileName\":\"\"},{\"id\":\"s70\",\"date\":\"2026-01-23\",\"category\":\"\u30C9\u30A2\u88DC\u4FEE\",\"content\":\"\u6E2F\u533A\",\"amount\":148000,\"payment\":\"\u73FE\u91D1\",\"invoiceStatus\":\"\",\"platform\":\"\u66AE\u3089\u3057\u30DE\u30FC\u30B1\u30C3\u30C8\",\"note\":\"\",\"voucherNo\":\"\",\"fileName\":\"\"},{\"id\":\"s71\",\"date\":\"2026-01-23\",\"category\":\"\u30AF\u30ED\u30B9\u5F35\u66FF\",\"content\":\"\u5DDD\u53E3\",\"amount\":41000,\"payment\":\"\u73FE\u91D1\",\"invoiceStatus\":\"\",\"platform\":\"\u66AE\u3089\u3057\u30DE\u30FC\u30B1\u30C3\u30C8\",\"note\":\"\",\"voucherNo\":\"\",\"fileName\":\"\"},{\"id\":\"s72\",\"date\":\"2026-01-24\",\"category\":\"\u7A74\u88DC\u4FEE\",\"content\":\"\u65B0\u5BBF\",\"amount\":25000,\"payment\":\"\u73FE\u91D1\",\"invoiceStatus\":\"\u9818\u53CE\u66F8\u767A\u884C\u6E08\u307F\",\"platform\":\"line\",\"note\":\"\",\"voucherNo\":\"\",\"fileName\":\"\"},{\"id\":\"s73\",\"date\":\"2026-01-24\",\"category\":\"\u7A74\u88DC\u4FEE\",\"content\":\"\u65B0\u5BBF\",\"amount\":39000,\"payment\":\"\u30D7\u30E9\u30C3\u30C8\u30D5\u30A9\u30FC\u30E0\u5165\u91D1\",\"invoiceStatus\":\"\",\"platform\":\"\u66AE\u3089\u3057\u30DE\u30FC\u30B1\u30C3\u30C8\",\"note\":\"\",\"voucherNo\":\"\",\"fileName\":\"\"},{\"id\":\"s74\",\"date\":\"2026-01-25\",\"category\":\"\u30AF\u30ED\u30B9\u5F35\u66FF\",\"content\":\"\u7DF4\u99AC\",\"amount\":32000,\"payment\":\"\u73FE\u91D1\",\"invoiceStatus\":\"\",\"platform\":\"\u66AE\u3089\u3057\u30DE\u30FC\u30B1\u30C3\u30C8\",\"note\":\"\",\"voucherNo\":\"\",\"fileName\":\"\"},{\"id\":\"s75\",\"date\":\"2026-01-27\",\"category\":\"\u30AF\u30ED\u30B9\u5F35\u66FF\",\"content\":\"\u65E9\u7A32\u7530\",\"amount\":77000,\"payment\":\"\u6CD5\u4EBA\u53E3\u5EA7\u632F\u308A\u8FBC\u307F\",\"invoiceStatus\":\"\u9818\u53CE\u66F8\u767A\u884C\u6E08\u307F\",\"platform\":\"wechat\",\"note\":\"\",\"voucherNo\":\"\",\"fileName\":\"\"},{\"id\":\"s76\",\"date\":\"2026-01-28\",\"category\":\"\u30AF\u30ED\u30B9\u5F35\u66FF\",\"content\":\"\u5927\u7530\u533A\",\"amount\":194000,\"payment\":\"\u6CD5\u4EBA\u53E3\u5EA7\u632F\u308A\u8FBC\u307F\",\"invoiceStatus\":\"\",\"platform\":\"\u66AE\u3089\u3057\u30DE\u30FC\u30B1\u30C3\u30C8\",\"note\":\"\",\"voucherNo\":\"\",\"fileName\":\"\"},{\"id\":\"s77\",\"date\":\"2026-01-29\",\"category\":\"\u30AF\u30ED\u30B9\u5F35\u66FF\",\"content\":\"\u4E2D\u91CE\",\"amount\":94000,\"payment\":\"\",\"invoiceStatus\":\"\",\"platform\":\"\u66AE\u3089\u3057\u30DE\u30FC\u30B1\u30C3\u30C8\",\"note\":\"\",\"voucherNo\":\"\",\"fileName\":\"\"},{\"id\":\"s78\",\"date\":\"2026-01-29\",\"category\":\"\u7A74\u88DC\u4FEE\",\"content\":\"\u8DB3\u7ACB\u533A\",\"amount\":25000,\"payment\":\"\",\"invoiceStatus\":\"\",\"platform\":\"\u66AE\u3089\u3057\u30DE\u30FC\u30B1\u30C3\u30C8\",\"note\":\"\",\"voucherNo\":\"\",\"fileName\":\"\"},{\"id\":\"s79\",\"date\":\"2026-01-31\",\"category\":\"\u30AF\u30ED\u30B9\u5F35\u66FF\",\"content\":\"\u677F\u6A4B\u533A\",\"amount\":144000,\"payment\":\"\",\"invoiceStatus\":\"\",\"platform\":\"\u66AE\u3089\u3057\u30DE\u30FC\u30B1\u30C3\u30C8\",\"note\":\"\",\"voucherNo\":\"\",\"fileName\":\"\"},{\"id\":\"s80\",\"date\":\"2026-01-31\",\"category\":\"\u30AF\u30ED\u30B9\u5F35\u66FF\",\"content\":\"dynast\u5408\u540C\u4F1A\u793E\",\"amount\":347203,\"payment\":\"\u6CD5\u4EBA\u53E3\u5EA7\u632F\u308A\u8FBC\u307F\",\"invoiceStatus\":\"\u8ACB\u6C42\u66F8\u767A\u884C\u6E08\u307F\",\"platform\":\"dynast\u5408\u540C\u4F1A\u793E\",\"note\":\"\",\"voucherNo\":\"\",\"fileName\":\"\"},{\"id\":\"s81\",\"date\":\"2026-02-06\",\"category\":\"\u7A74\u88DC\u4FEE\",\"content\":\"\u677F\u6A4B\u533A\",\"amount\":102000,\"payment\":\"\u30D7\u30E9\u30C3\u30C8\u30D5\u30A9\u30FC\u30E0\u5165\u91D1\",\"invoiceStatus\":\"\u7121\u3057\",\"platform\":\"\u66AE\u3089\u3057\u30DE\u30FC\u30B1\u30C3\u30C8\",\"note\":\"\",\"voucherNo\":\"\",\"fileName\":\"\"},{\"id\":\"s82\",\"date\":\"2026-02-07\",\"category\":\"\u30AF\u30ED\u30B9\u5F35\u66FF\",\"content\":\"\u7DF4\u99AC\u533A\",\"amount\":259000,\"payment\":\"\",\"invoiceStatus\":\"\",\"platform\":\"\u66AE\u3089\u3057\u30DE\u30FC\u30B1\u30C3\u30C8\",\"note\":\"\",\"voucherNo\":\"\",\"fileName\":\"\"},{\"id\":\"s83\",\"date\":\"2026-02-08\",\"category\":\"\u7A74\u88DC\u4FEE\",\"content\":\"\u5317\u533A\",\"amount\":25000,\"payment\":\"\",\"invoiceStatus\":\"\",\"platform\":\"\u66AE\u3089\u3057\u30DE\u30FC\u30B1\u30C3\u30C8\",\"note\":\"\",\"voucherNo\":\"\",\"fileName\":\"\"},{\"id\":\"s84\",\"date\":\"2026-02-12\",\"category\":\"\u30AF\u30ED\u30B9\u5F35\u66FF\",\"content\":\"\u65B0\u5BBF\",\"amount\":337000,\"payment\":\"\",\"invoiceStatus\":\"\",\"platform\":\"line\",\"note\":\"\",\"voucherNo\":\"\",\"fileName\":\"\"},{\"id\":\"s85\",\"date\":\"2026-02-14\",\"category\":\"\u30AB\u30FC\u30DA\u30C3\u30C8\",\"content\":\"\u5927\u585A\u30FB\u682A\u5F0F\u4F1A\u793EWOOC\",\"amount\":31680,\"payment\":\"\u6CD5\u4EBA\u53E3\u5EA7\u632F\u308A\u8FBC\u307F\",\"invoiceStatus\":\"\u8ACB\u6C42\u66F8\u767A\u884C\u6E08\u307F\",\"platform\":\"line\",\"note\":\"\",\"voucherNo\":\"\",\"fileName\":\"\"},{\"id\":\"s86\",\"date\":\"2026-02-15\",\"category\":\"\u30AF\u30ED\u30B9\u5F35\u66FF\",\"content\":\"\u8C4A\u5CF6\u533A\",\"amount\":290000,\"payment\":\"\u73FE\u91D1\",\"invoiceStatus\":\"\",\"platform\":\"\u66AE\u3089\u3057\u30DE\u30FC\u30B1\u30C3\u30C8\",\"note\":\"\",\"voucherNo\":\"\",\"fileName\":\"\"},{\"id\":\"s87\",\"date\":\"2026-02-16\",\"category\":\"\u7A74\u88DC\u4FEE\",\"content\":\"\u58A8\u7530\u533A\",\"amount\":25000,\"payment\":\"\u73FE\u91D1\",\"invoiceStatus\":\"\",\"platform\":\"\u66AE\u3089\u3057\u30DE\u30FC\u30B1\u30C3\u30C8\",\"note\":\"\",\"voucherNo\":\"\",\"fileName\":\"\"},{\"id\":\"s88\",\"date\":\"2026-02-17\",\"category\":\"\u30AF\u30ED\u30B9\u5F35\u66FF\u30FBC F\",\"content\":\"\u65B0\u5BBF\",\"amount\":165000,\"payment\":\"\u6CD5\u4EBA\u53E3\u5EA7\u632F\u308A\u8FBC\u307F\",\"invoiceStatus\":\"\",\"platform\":\"\u66AE\u3089\u3057\u30DE\u30FC\u30B1\u30C3\u30C8\",\"note\":\"\",\"voucherNo\":\"\",\"fileName\":\"\"},{\"id\":\"s89\",\"date\":\"2026-02-18\",\"category\":\"\u30AF\u30ED\u30B9\u5F35\u66FF\u30FBC F\",\"content\":\"\u677F\u6A4B\u533A\",\"amount\":198000,\"payment\":\"\",\"invoiceStatus\":\"\",\"platform\":\"\u66AE\u3089\u3057\u30DE\u30FC\u30B1\u30C3\u30C8\",\"note\":\"\",\"voucherNo\":\"\",\"fileName\":\"\"},{\"id\":\"s90\",\"date\":\"2026-02-19\",\"category\":\"\u30AF\u30ED\u30B9\u5F35\u66FF\",\"content\":\"\u6E0B\u8C37\u30FB\u4ECA\u7530\u69D8\",\"amount\":660000,\"payment\":\"\u6CD5\u4EBA\u53E3\u5EA7\u632F\u308A\u8FBC\u307F\",\"invoiceStatus\":\"\u8ACB\u6C42\u66F8\u767A\u884C\u6E08\u307F\",\"platform\":\"line\",\"note\":\"\",\"voucherNo\":\"\",\"fileName\":\"\"},{\"id\":\"s91\",\"date\":\"2026-02-25\",\"category\":\"\u30AF\u30ED\u30B9\u5F35\u66FF\",\"content\":\"\u5317\u533A\",\"amount\":98000,\"payment\":\"\",\"invoiceStatus\":\"\",\"platform\":\"\u66AE\u3089\u3057\u30DE\u30FC\u30B1\u30C3\u30C8\",\"note\":\"\",\"voucherNo\":\"\",\"fileName\":\"\"},{\"id\":\"s92\",\"date\":\"2026-02-26\",\"category\":\"\u30AF\u30ED\u30B9\u5F35\u66FF\",\"content\":\"\u65B0\u5BBF\",\"amount\":66000,\"payment\":\"\",\"invoiceStatus\":\"\",\"platform\":\"line\",\"note\":\"\",\"voucherNo\":\"\",\"fileName\":\"\"},{\"id\":\"s93\",\"date\":\"2026-02-28\",\"category\":\"\u30AF\u30ED\u30B9\u5F35\u66FF\",\"content\":\"\u5927\u7530\u533A\",\"amount\":180000,\"payment\":\"\",\"invoiceStatus\":\"\u8ACB\u6C42\u66F8\u767A\u884C\u6E08\u307F\",\"platform\":\"\u66AE\u3089\u3057\u30DE\u30FC\u30B1\u30C3\u30C8\",\"note\":\"\",\"voucherNo\":\"\",\"fileName\":\"\"},{\"id\":\"s94\",\"date\":\"2026-02-28\",\"category\":\"\u30AF\u30ED\u30B9\u5F35\u66FF\",\"content\":\"dynast\u5408\u540C\u4F1A\u793E\",\"amount\":1242872,\"payment\":\"\u6CD5\u4EBA\u53E3\u5EA7\u632F\u308A\u8FBC\u307F\",\"invoiceStatus\":\"\u8ACB\u6C42\u66F8\u767A\u884C\u6E08\u307F\",\"platform\":\"dynast\u5408\u540C\u4F1A\u793E\",\"note\":\"\",\"voucherNo\":\"\",\"fileName\":\"\"},{\"id\":\"s95\",\"date\":\"2026-03-07\",\"category\":\"\u30AF\u30ED\u30B9\u5F35\u66FF\",\"content\":\"\u8C4A\u5CF6\u533A\",\"amount\":61250,\"payment\":\"\",\"invoiceStatus\":\"\u8ACB\u6C42\u66F8\u767A\u884C\u6E08\u307F\",\"platform\":\"\u66AE\u3089\u3057\u30DE\u30FC\u30B1\u30C3\u30C8\",\"note\":\"\",\"voucherNo\":\"\",\"fileName\":\"\"},{\"id\":\"s96\",\"date\":\"2026-03-08\",\"category\":\"\u30AF\u30ED\u30B9\u5F35\u66FF\",\"content\":\"K-carve life \u682A\u5F0F\u4F1A\u793E \u2003\",\"amount\":29403,\"payment\":\"\u6CD5\u4EBA\u53E3\u5EA7\u632F\u308A\u8FBC\u307F\",\"invoiceStatus\":\"\u8ACB\u6C42\u66F8\u767A\u884C\u6E08\u307F\",\"platform\":\"wechat\",\"note\":\"\",\"voucherNo\":\"\",\"fileName\":\"\"},{\"id\":\"s97\",\"date\":\"2026-03-11\",\"category\":\"\u7A74\u88DC\u4FEE\",\"content\":\"\u8C4A\u5CF6\u533A\",\"amount\":95000,\"payment\":\"\",\"invoiceStatus\":\"\",\"platform\":\"\u66AE\u3089\u3057\u30DE\u30FC\u30B1\u30C3\u30C8\",\"note\":\"\",\"voucherNo\":\"\",\"fileName\":\"\"},{\"id\":\"s98\",\"date\":\"2026-03-13\",\"category\":\"\u30AF\u30ED\u30B9\u5F35\u66FF\",\"content\":\"\u6749\u4E26\u533A\",\"amount\":89000,\"payment\":\"\",\"invoiceStatus\":\"\",\"platform\":\"\u66AE\u3089\u3057\u30DE\u30FC\u30B1\u30C3\u30C8\",\"note\":\"\",\"voucherNo\":\"\",\"fileName\":\"\"},{\"id\":\"s99\",\"date\":\"2026-03-15\",\"category\":\"\u30AF\u30ED\u30B9\u5F35\u66FF\",\"content\":\"\u677F\u6A4B\u533A\",\"amount\":37000,\"payment\":\"\",\"invoiceStatus\":\"\",\"platform\":\"\u66AE\u3089\u3057\u30DE\u30FC\u30B1\u30C3\u30C8\",\"note\":\"\",\"voucherNo\":\"\",\"fileName\":\"\"},{\"id\":\"s100\",\"date\":\"2026-03-17\",\"category\":\"\u30AF\u30ED\u30B9\u5F35\u66FF\",\"content\":\"\u65B0\u5BBF\",\"amount\":118085,\"payment\":\"\",\"invoiceStatus\":\"\",\"platform\":\"\u66AE\u3089\u3057\u30DE\u30FC\u30B1\u30C3\u30C8\",\"note\":\"\",\"voucherNo\":\"\",\"fileName\":\"\"},{\"id\":\"s101\",\"date\":\"2026-03-20\",\"category\":\"\u30AF\u30ED\u30B9\u5F35\u66FF\",\"content\":\"\u8D64\u7FBD\",\"amount\":100000,\"payment\":\"\",\"invoiceStatus\":\"\",\"platform\":\"line\",\"note\":\"\",\"voucherNo\":\"\",\"fileName\":\"\"},{\"id\":\"s102\",\"date\":\"2026-03-20\",\"category\":\"\u30AF\u30ED\u30B9\u5F35\u66FF\",\"content\":\"\u8C4A\u5CF6\u533A\",\"amount\":11000,\"payment\":\"\",\"invoiceStatus\":\"\",\"platform\":\"line\",\"note\":\"\",\"voucherNo\":\"\",\"fileName\":\"\"},{\"id\":\"s103\",\"date\":\"2026-03-21\",\"category\":\"\u30AF\u30ED\u30B9\u5F35\u66FF\",\"content\":\"\u4E16\u7530\u8C37\",\"amount\":204000,\"payment\":\"\",\"invoiceStatus\":\"\",\"platform\":\"\u66AE\u3089\u3057\u30DE\u30FC\u30B1\u30C3\u30C8\",\"note\":\"\",\"voucherNo\":\"\",\"fileName\":\"\"},{\"id\":\"s104\",\"date\":\"2026-03-25\",\"category\":\"\u30AF\u30ED\u30B9\u5F35\u66FF\",\"content\":\"\u76EE\u9ED2\",\"amount\":98000,\"payment\":\"\",\"invoiceStatus\":\"\",\"platform\":\"\u66AE\u3089\u3057\u30DE\u30FC\u30B1\u30C3\u30C8\",\"note\":\"\",\"voucherNo\":\"\",\"fileName\":\"\"},{\"id\":\"s105\",\"date\":\"2026-03-25\",\"category\":\"\u30AF\u30ED\u30B9\u5F35\u66FF\u30FBC F\",\"content\":\"\u5317\u533A\",\"amount\":62000,\"payment\":\"\",\"invoiceStatus\":\"\",\"platform\":\"\u66AE\u3089\u3057\u30DE\u30FC\u30B1\u30C3\u30C8\",\"note\":\"\",\"voucherNo\":\"\",\"fileName\":\"\"},{\"id\":\"s106\",\"date\":\"2026-03-28\",\"category\":\"\u30AF\u30ED\u30B9\u5F35\u66FF\u30FBC F\",\"content\":\"\u6749\u4E26\u533A\",\"amount\":131000,\"payment\":\"\",\"invoiceStatus\":\"\",\"platform\":\"\u66AE\u3089\u3057\u30DE\u30FC\u30B1\u30C3\u30C8\",\"note\":\"\",\"voucherNo\":\"\",\"fileName\":\"\"},{\"id\":\"s107\",\"date\":\"2026-03-28\",\"category\":\"\u30AF\u30ED\u30B9\u5F35\u66FF\",\"content\":\"\u6C60\u888B\",\"amount\":91000,\"payment\":\"\",\"invoiceStatus\":\"\",\"platform\":\"\u66AE\u3089\u3057\u30DE\u30FC\u30B1\u30C3\u30C8\",\"note\":\"\",\"voucherNo\":\"\",\"fileName\":\"\"},{\"id\":\"s108\",\"date\":\"2026-03-29\",\"category\":\"\u30AF\u30ED\u30B9\u5F35\u66FF\",\"content\":\"\u7DF4\u99AC\u533A\",\"amount\":165000,\"payment\":\"\",\"invoiceStatus\":\"\",\"platform\":\"\u66AE\u3089\u3057\u30DE\u30FC\u30B1\u30C3\u30C8\",\"note\":\"\",\"voucherNo\":\"\",\"fileName\":\"\"},{\"id\":\"s109\",\"date\":\"2026-03-30\",\"category\":\"\u30AF\u30ED\u30B9\u5F35\u66FF\",\"content\":\"\u4E16\u7530\u8C37\u533A\",\"amount\":133000,\"payment\":\"\",\"invoiceStatus\":\"\",\"platform\":\"\u66AE\u3089\u3057\u30DE\u30FC\u30B1\u30C3\u30C8\",\"note\":\"\",\"voucherNo\":\"\",\"fileName\":\"\"},{\"id\":\"s110\",\"date\":\"2026-03-31\",\"category\":\"\u30AF\u30ED\u30B9\u5F35\u66FF\",\"content\":\"dynast\u5408\u540C\u4F1A\u793E\",\"amount\":1623984,\"payment\":\"\u6CD5\u4EBA\u53E3\u5EA7\u632F\u308A\u8FBC\u307F\",\"invoiceStatus\":\"\u8ACB\u6C42\u66F8\u767A\u884C\u6E08\u307F\",\"platform\":\"dynast\u5408\u540C\u4F1A\u793E\",\"note\":\"\",\"voucherNo\":\"\",\"fileName\":\"\"},{\"id\":\"s111\",\"date\":\"2026-04-01\",\"category\":\"\u30AF\u30ED\u30B9\u5F35\u66FF\",\"content\":\"\u6674\u6D77\",\"amount\":98000,\"payment\":\"\u6CD5\u4EBA\u53E3\u5EA7\u632F\u308A\u8FBC\u307F\",\"invoiceStatus\":\"\",\"platform\":\"line\",\"note\":\"\",\"voucherNo\":\"\",\"fileName\":\"\"},{\"id\":\"s112\",\"date\":\"2026-04-05\",\"category\":\"\u30AF\u30ED\u30B9\u5F35\u66FF\u30FB\u7DB2\u6238\u4EA4\u63DB\",\"content\":\"\u7DF4\u99AC\u533A\",\"amount\":93840,\"payment\":\"\u73FE\u91D1\",\"invoiceStatus\":\"\",\"platform\":\"\u66AE\u3089\u3057\u30DE\u30FC\u30B1\u30C3\u30C8\",\"note\":\"\",\"voucherNo\":\"\",\"fileName\":\"\"},{\"id\":\"s113\",\"date\":\"2026-04-08\",\"category\":\"\u30AF\u30ED\u30B9\u5F35\u66FF\",\"content\":\"\u7DF4\u99AC\u533A\",\"amount\":148000,\"payment\":\"\",\"invoiceStatus\":\"\",\"platform\":\"\u66AE\u3089\u3057\u30DE\u30FC\u30B1\u30C3\u30C8\",\"note\":\"\",\"voucherNo\":\"\",\"fileName\":\"\"},{\"id\":\"s114\",\"date\":\"2026-04-10\",\"category\":\"\u30AF\u30ED\u30B9\u5F35\u66FF\",\"content\":\"\u677F\u6A4B\u533A\",\"amount\":32000,\"payment\":\"\",\"invoiceStatus\":\"\",\"platform\":\"\u66AE\u3089\u3057\u30DE\u30FC\u30B1\u30C3\u30C8\",\"note\":\"\",\"voucherNo\":\"\",\"fileName\":\"\"},{\"id\":\"s115\",\"date\":\"2026-04-11\",\"category\":\"\u30AF\u30ED\u30B9\u5F35\u66FF\",\"content\":\"\u8DB3\u7ACB\u533A\",\"amount\":130000,\"payment\":\"\",\"invoiceStatus\":\"\",\"platform\":\"line\",\"note\":\"\",\"voucherNo\":\"\",\"fileName\":\"\"},{\"id\":\"s116\",\"date\":\"2026-04-17\",\"category\":\"\u30AF\u30ED\u30B9\u5F35\u66FF\",\"content\":\"\u4E2D\u91CE\u533A\u4E0A\u9AD8\u75301-1-16\",\"amount\":146960,\"payment\":\"\u6CD5\u4EBA\u53E3\u5EA7\u632F\u308A\u8FBC\u307F\",\"invoiceStatus\":\"\u8ACB\u6C42\u66F8\u767A\u884C\u6E08\u307F\",\"platform\":\"\u66AE\u3089\u3057\u30DE\u30FC\u30B1\u30C3\u30C8\",\"note\":\"\",\"voucherNo\":\"\",\"fileName\":\"\"},{\"id\":\"s117\",\"date\":\"2026-04-18\",\"category\":\"\u30AF\u30ED\u30B9\u5F35\u66FF\",\"content\":\"\u6C60\u888B\",\"amount\":243000,\"payment\":\"\",\"invoiceStatus\":\"\",\"platform\":\"\u66AE\u3089\u3057\u30DE\u30FC\u30B1\u30C3\u30C8\",\"note\":\"\",\"voucherNo\":\"\",\"fileName\":\"\"},{\"id\":\"s118\",\"date\":\"2026-04-23\",\"category\":\"\u30AF\u30ED\u30B9\u5F35\u66FF\",\"content\":\"\u8352\u5DDD\",\"amount\":50000,\"payment\":\"\",\"invoiceStatus\":\"\",\"platform\":\"\u66AE\u3089\u3057\u30DE\u30FC\u30B1\u30C3\u30C8\",\"note\":\"\",\"voucherNo\":\"\",\"fileName\":\"\"},{\"id\":\"s119\",\"date\":\"2026-04-23\",\"category\":\"\u7A74\u88DC\u4FEE\",\"content\":\"\u65B0\u5BBF\",\"amount\":25000,\"payment\":\"\",\"invoiceStatus\":\"\",\"platform\":\"line\",\"note\":\"\",\"voucherNo\":\"\",\"fileName\":\"\"},{\"id\":\"s120\",\"date\":\"2026-04-24\",\"category\":\"\u30AF\u30ED\u30B9\u5F35\u66FF\",\"content\":\"\u4E2D\u91CE\",\"amount\":61000,\"payment\":\"\",\"invoiceStatus\":\"\",\"platform\":\"\u66AE\u3089\u3057\u30DE\u30FC\u30B1\u30C3\u30C8\",\"note\":\"\",\"voucherNo\":\"\",\"fileName\":\"\"},{\"id\":\"s121\",\"date\":\"2026-04-24\",\"category\":\"\u7DB2\u6238\u4EA4\u63DB\",\"content\":\"\u8DB3\u7ACB\u533A\",\"amount\":10000,\"payment\":\"\",\"invoiceStatus\":\"\",\"platform\":\"\u66AE\u3089\u3057\u30DE\u30FC\u30B1\u30C3\u30C8\",\"note\":\"\",\"voucherNo\":\"\",\"fileName\":\"\"},{\"id\":\"s122\",\"date\":\"2026-04-25\",\"category\":\"\u30AF\u30ED\u30B9\u5F35\u66FF\",\"content\":\"\u9280\u5EA7\",\"amount\":87000,\"payment\":\"\u6CD5\u4EBA\u53E3\u5EA7\u632F\u308A\u8FBC\u307F\",\"invoiceStatus\":\"\u8ACB\u6C42\u66F8\u767A\u884C\u6E08\u307F\",\"platform\":\"\u66AE\u3089\u3057\u30DE\u30FC\u30B1\u30C3\u30C8\",\"note\":\"\",\"voucherNo\":\"\",\"fileName\":\"\"},{\"id\":\"s123\",\"date\":\"2026-04-26\",\"category\":\"\u6249\u88DC\u4FEE\",\"content\":\"\u65B0\u5BBF\",\"amount\":35000,\"payment\":\"\",\"invoiceStatus\":\"\",\"platform\":\"\u66AE\u3089\u3057\u30DE\u30FC\u30B1\u30C3\u30C8\",\"note\":\"\",\"voucherNo\":\"\",\"fileName\":\"\"}],\"expenses\":[{\"id\":\"e2\",\"date\":\"2025-10-06\",\"category\":\"\u8CA9\u58F2\u624B\u6570\u6599\",\"content\":\"\u66AE\u3089\u3057\u30DE\u30FC\u30B1\u30C3\u30C8\u624B\u6570\u6599\",\"amount\":181532,\"payment\":\"\u30B3\u30F3\u30D3\u30CB\u652F\u6255\u3044\",\"invoiceStatus\":\"\u9818\u53CE\u66F8\u6709\",\"note\":\"\",\"voucherNo\":\"\",\"fileName\":\"\"},{\"id\":\"e3\",\"date\":\"2025-10-06\",\"category\":\"\u96D1\u8CBB\",\"content\":\"\u624B\u6570\u6599\u3001N2\u767A\u884C\u8A3C\u660E\u66F8\",\"amount\":1500,\"payment\":\"\u30B3\u30F3\u30D3\u30CB\u652F\u6255\u3044\",\"invoiceStatus\":\"\u9818\u53CE\u66F8\u6709\",\"note\":\"\",\"voucherNo\":\"\",\"fileName\":\"\"},{\"id\":\"e4\",\"date\":\"2025-10-28\",\"category\":\"\u5C02\u9580\u30B5\u30FC\u30D3\u30B9\u8CBB\",\"content\":\"\u6C7A\u7B97\u95A2\u9023\u8CBB\u7528\uFF08\u7A0E\u7406\u58EB\u5831\u916C\uFF09\",\"amount\":260643,\"payment\":\"\u6CD5\u4EBA\u53E3\u5EA7\u632F\u308A\u8FBC\u307F\",\"invoiceStatus\":\"\u8ACB\u6C42\u66F8\u6709\",\"note\":\"\",\"voucherNo\":\"\",\"fileName\":\"\"},{\"id\":\"e5\",\"date\":\"2025-10-29\",\"category\":\"\u5730\u4EE3\u5BB6\u8CC3\",\"content\":\"\u4E8B\u52D9\u6240\u5BB6\u8CC3\",\"amount\":230000,\"payment\":\"\u6CD5\u4EBA\u53E3\u5EA7\u632F\u308A\u8FBC\u307F\",\"invoiceStatus\":\"\u7121\u3057\",\"note\":\"\",\"voucherNo\":\"\",\"fileName\":\"\"},{\"id\":\"e6\",\"date\":\"2025-10-30\",\"category\":\"\u6750\u6599\u8CBB\",\"content\":\"\u58C1\u7D19\u30B3\u30B9\u30C8\uFF08\u65BD\u5DE5\u7528\u8CC7\u6750\u8CBB\uFF09\",\"amount\":405112,\"payment\":\"\u6CD5\u4EBA\u53E3\u5EA7\u632F\u308A\u8FBC\u307F\",\"invoiceStatus\":\"\u8ACB\u6C42\u66F8\u6709\",\"note\":\"\",\"voucherNo\":\"\",\"fileName\":\"\"},{\"id\":\"e7\",\"date\":\"2025-10-31\",\"category\":\"\u8ECA\u4E21\u8CBB\",\"content\":\"\u9AD8\u901F\u9053\u8DEF\u6599\u91D1\uFF08ETC\u81EA\u52D5\u5F15\u843D\u30FB2\u53F0\u8ECA\",\"amount\":9810,\"payment\":\"\u53E3\u5EA7\u632F\u66FF\uFF08\u81EA\u52D5\u5F15\u843D\uFF09\",\"invoiceStatus\":\"\u7121\u3057\",\"note\":\"\",\"voucherNo\":\"\",\"fileName\":\"\"},{\"id\":\"e8\",\"date\":\"2025-10-31\",\"category\":\"\u5730\u4EE3\u5BB6\u8CC3\",\"content\":\"\",\"amount\":230000,\"payment\":\"\u6CD5\u4EBA\u53E3\u5EA7\u632F\u308A\u8FBC\u307F\",\"invoiceStatus\":\"\u7121\u3057\",\"note\":\"\",\"voucherNo\":\"\",\"fileName\":\"\"},{\"id\":\"e9\",\"date\":\"2025-11-04\",\"category\":\"\u79DF\u7A0E\u516C\u8AB2\",\"content\":\"\u6CD5\u4EBA\u7A0E\u30FB\u90FD\u6C11\u7A0E\u30FB\u5730\u65B9\u6CD5\u4EBA\u7A0E\",\"amount\":185000,\"payment\":\"\u3086\u3046\u3061\u3087\u652F\u6255\u3044\",\"invoiceStatus\":\"\u9818\u53CE\u66F8\u6709\",\"note\":\"\",\"voucherNo\":\"\",\"fileName\":\"\"},{\"id\":\"e10\",\"date\":\"2025-11-12\",\"category\":\"\u8CA9\u58F2\u624B\u6570\u6599\",\"content\":\"\u66AE\u3089\u3057\u30DE\u30FC\u30B1\u30C3\u30C8\u624B\u6570\u6599\",\"amount\":261093,\"payment\":\"\u30B3\u30F3\u30D3\u30CB\u652F\u6255\u3044\",\"invoiceStatus\":\"\u9818\u53CE\u66F8\u6709\",\"note\":\"\",\"voucherNo\":\"\",\"fileName\":\"\"},{\"id\":\"e11\",\"date\":\"2025-11-12\",\"category\":\"\u5C02\u9580\u30B5\u30FC\u30D3\u30B9\u8CBB\",\"content\":\"\u30D3\u30B6\u66F4\u65B0\u8CC7\u6599\u76F8\u8AC7\u8CBB\",\"amount\":5643,\"payment\":\"\u6CD5\u4EBA\u53E3\u5EA7\u632F\u308A\u8FBC\u307F\",\"invoiceStatus\":\"\u8ACB\u6C42\u66F8\u6709\",\"note\":\"\",\"voucherNo\":\"\",\"fileName\":\"\"}],\"settings\":{\"fiscalYearStart\":\"2025-10-01\",\"bankOpeningBalance\":0,\"cashOpeningBalance\":0}}");
+    
+    // ===========================================
+    // メインAPP
+    // ===========================================
+    function App() {
+      var _useState = useState(null),
+        _useState2 = _slicedToArray(_useState, 2),
+        data = _useState2[0],
+        setData = _useState2[1];
+      var _useState3 = useState('dashboard'),
+        _useState4 = _slicedToArray(_useState3, 2),
+        view = _useState4[0],
+        setView = _useState4[1];
+      var _useState5 = useState(false),
+        _useState6 = _slicedToArray(_useState5, 2),
+        showMenu = _useState6[0],
+        setShowMenu = _useState6[1];
+      var _useState7 = useState(null),
+        _useState8 = _slicedToArray(_useState7, 2),
+        toast = _useState8[0],
+        setToast = _useState8[1];
+      useEffect(function () {
+        _asyncToGenerator(/*#__PURE__*/_regenerator().m(function _callee() {
+          var r, _t;
+          return _regenerator().w(function (_context) {
+            while (1) switch (_context.p = _context.n) {
+              case 0:
+                _context.p = 0;
+                _context.n = 1;
+                return window.storage.get('accounting_data');
+              case 1:
+                r = _context.v;
+                if (r && r.value) setData(JSON.parse(r.value));else setData(INITIAL_DATA);
+                _context.n = 3;
+                break;
+              case 2:
+                _context.p = 2;
+                _t = _context.v;
+                setData(INITIAL_DATA);
+              case 3:
+                return _context.a(2);
+            }
+          }, _callee, null, [[0, 2]]);
+        }))();
+      }, []);
+      useEffect(function () {
+        if (!data) return;
+        var t = setTimeout(function () {
+          window.storage.set('accounting_data', JSON.stringify(data))["catch"](function () {});
+        }, 500);
+        return function () {
+          return clearTimeout(t);
+        };
+      }, [data]);
+      var showToast = function showToast(msg) {
+        var type = arguments.length > 1 && arguments[1] !== undefined ? arguments[1] : 'success';
+        setToast({
+          msg: msg,
+          type: type
+        });
+        setTimeout(function () {
+          return setToast(null);
+        }, 2500);
+      };
+      if (!data) {
+        return /*#__PURE__*/React.createElement("div", {
+          className: "min-h-screen flex items-center justify-center text-stone-500"
+        }, "\u8AAD\u307F\u8FBC\u307F\u4E2D...");
+      }
+      var navItems = [{
+        id: 'dashboard',
+        label: 'ダッシュボード',
+        icon: 'Home'
+      }, {
+        id: 'sales',
+        label: '売上帳',
+        icon: 'TrendingUp'
+      }, {
+        id: 'expenses',
+        label: '支出帳',
+        icon: 'TrendingDown'
+      }, {
+        id: 'receivables',
+        label: '売掛金',
+        icon: 'Receipt'
+      }, {
+        id: 'payables',
+        label: '買掛金',
+        icon: 'AlertTriangle'
+      }, {
+        id: 'bank',
+        label: '銀行照合',
+        icon: 'Bank'
+      }, {
+        id: 'reports',
+        label: 'レポート',
+        icon: 'FileText'
+      }, {
+        id: 'export',
+        label: 'データ管理',
+        icon: 'Download'
+      }, {
+        id: 'settings',
+        label: '設定',
+        icon: 'Settings'
+      }];
+      return /*#__PURE__*/React.createElement("div", {
+        className: "min-h-screen bg-stone-100"
+      }, /*#__PURE__*/React.createElement("header", {
+        className: "bg-white border-b border-stone-300 sticky top-0 z-30 shadow-sm"
+      }, /*#__PURE__*/React.createElement("div", {
+        className: "flex items-center justify-between px-4 md:px-6 py-2.5"
+      }, /*#__PURE__*/React.createElement("div", {
+        className: "flex items-center gap-3"
+      }, /*#__PURE__*/React.createElement("button", {
+        className: "md:hidden p-1",
+        onClick: function onClick() {
+          return setShowMenu(true);
+        }
+      }, /*#__PURE__*/React.createElement(Icon, {
+        name: "Menu",
+        size: 22
+      })), /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement("h1", {
+        className: "text-base md:text-lg font-bold text-stone-900 font-serif"
+      }, "\u8A18\u5E33\u30B7\u30B9\u30C6\u30E0"), /*#__PURE__*/React.createElement("div", {
+        className: "text-xs text-stone-500 hidden md:block"
+      }, "\u4F1A\u8A08\u5E74\u5EA6: ", data.settings.fiscalYearStart, " ~"))), /*#__PURE__*/React.createElement("div", {
+        className: "flex items-center gap-2 text-xs text-stone-500"
+      }, /*#__PURE__*/React.createElement("span", {
+        className: "hidden md:inline"
+      }, data.sales.length, "\u4EF6\u58F2\u4E0A / ", data.expenses.length, "\u4EF6\u652F\u51FA"))), /*#__PURE__*/React.createElement("nav", {
+        className: "hidden md:flex border-t border-stone-200 px-4"
+      }, navItems.map(function (item) {
+        return /*#__PURE__*/React.createElement("button", {
+          key: item.id,
+          onClick: function onClick() {
+            return setView(item.id);
+          },
+          className: "px-4 py-2.5 text-sm font-medium border-b-2 transition flex items-center gap-1.5 ".concat(view === item.id ? 'border-indigo-700 text-indigo-700' : 'border-transparent text-stone-600 hover:text-stone-900')
+        }, /*#__PURE__*/React.createElement(Icon, {
+          name: item.icon,
+          size: 14
+        }), item.label);
+      }))), showMenu && /*#__PURE__*/React.createElement("div", {
+        className: "md:hidden fixed inset-0 z-50 bg-black/40",
+        onClick: function onClick() {
+          return setShowMenu(false);
+        }
+      }, /*#__PURE__*/React.createElement("div", {
+        className: "bg-white w-64 h-full p-4",
+        onClick: function onClick(e) {
+          return e.stopPropagation();
+        }
+      }, /*#__PURE__*/React.createElement("div", {
+        className: "flex items-center justify-between mb-4"
+      }, /*#__PURE__*/React.createElement("h2", {
+        className: "text-base font-bold font-serif"
+      }, "\u30E1\u30CB\u30E5\u30FC"), /*#__PURE__*/React.createElement("button", {
+        onClick: function onClick() {
+          return setShowMenu(false);
+        }
+      }, /*#__PURE__*/React.createElement(Icon, {
+        name: "X",
+        size: 20
+      }))), /*#__PURE__*/React.createElement("nav", {
+        className: "space-y-0.5"
+      }, navItems.map(function (item) {
+        return /*#__PURE__*/React.createElement("button", {
+          key: item.id,
+          onClick: function onClick() {
+            setView(item.id);
+            setShowMenu(false);
+          },
+          className: "w-full flex items-center gap-3 px-3 py-2.5 rounded-md text-left transition ".concat(view === item.id ? 'bg-indigo-700 text-white' : 'text-stone-700 hover:bg-stone-100')
+        }, /*#__PURE__*/React.createElement(Icon, {
+          name: item.icon,
+          size: 16
+        }), /*#__PURE__*/React.createElement("span", {
+          className: "text-sm"
+        }, item.label));
+      })))), /*#__PURE__*/React.createElement("main", {
+        className: "p-3 md:p-5 pb-24 md:pb-5"
+      }, view === 'dashboard' && /*#__PURE__*/React.createElement(Dashboard, {
+        data: data,
+        onNavigate: setView
+      }), view === 'sales' && /*#__PURE__*/React.createElement(LedgerView, {
+        type: "sale",
+        data: data,
+        setData: setData,
+        showToast: showToast
+      }), view === 'expenses' && /*#__PURE__*/React.createElement(LedgerView, {
+        type: "expense",
+        data: data,
+        setData: setData,
+        showToast: showToast
+      }), view === 'receivables' && /*#__PURE__*/React.createElement(ReceivablesView, {
+        data: data
+      }), view === 'payables' && /*#__PURE__*/React.createElement(PayablesView, {
+        data: data
+      }), view === 'bank' && /*#__PURE__*/React.createElement(BankView, {
+        data: data,
+        showToast: showToast
+      }), view === 'reports' && /*#__PURE__*/React.createElement(ReportsView, {
+        data: data
+      }), view === 'export' && /*#__PURE__*/React.createElement(ExportView, {
+        data: data,
+        setData: setData,
+        showToast: showToast
+      }), view === 'settings' && /*#__PURE__*/React.createElement(SettingsView, {
+        data: data,
+        setData: setData,
+        showToast: showToast
+      })), /*#__PURE__*/React.createElement("nav", {
+        className: "md:hidden fixed bottom-0 left-0 right-0 bg-white border-t border-stone-300 grid grid-cols-5 z-20"
+      }, [{
+        id: 'dashboard',
+        label: 'ホーム',
+        icon: 'Home'
+      }, {
+        id: 'sales',
+        label: '売上',
+        icon: 'TrendingUp'
+      }, {
+        id: 'expenses',
+        label: '支出',
+        icon: 'TrendingDown'
+      }, {
+        id: 'bank',
+        label: '照合',
+        icon: 'Bank'
+      }, {
+        id: 'reports',
+        label: 'レポート',
+        icon: 'FileText'
+      }].map(function (item) {
+        return /*#__PURE__*/React.createElement("button", {
+          key: item.id,
+          onClick: function onClick() {
+            return setView(item.id);
+          },
+          className: "flex flex-col items-center justify-center py-2 text-xs ".concat(view === item.id ? 'text-indigo-700' : 'text-stone-500')
+        }, /*#__PURE__*/React.createElement(Icon, {
+          name: item.icon,
+          size: 18
+        }), /*#__PURE__*/React.createElement("span", {
+          className: "mt-0.5"
+        }, item.label));
+      })), toast && /*#__PURE__*/React.createElement("div", {
+        className: "fixed top-20 left-1/2 -translate-x-1/2 z-[60] px-4 py-2.5 rounded-md shadow-lg text-sm text-white ".concat(toast.type === 'error' ? 'bg-rose-600' : 'bg-emerald-600')
+      }, toast.msg));
+    }
+    
+    // ===========================================
+    // ダッシュボード
+    // ===========================================
+    function Dashboard(_ref3) {
+      var data = _ref3.data,
+        onNavigate = _ref3.onNavigate;
+      var stats = useMemo(function () {
+        var fyStart = data.settings.fiscalYearStart;
+        var fyEnd = new Date(fyStart);
+        fyEnd.setFullYear(fyEnd.getFullYear() + 1);
+        fyEnd.setDate(fyEnd.getDate() - 1);
+        var fyEndStr = fyEnd.toISOString().slice(0, 10);
+        var inFY = function inFY(d) {
+          return d >= fyStart && d <= fyEndStr;
+        };
+        var salesInFY = data.sales.filter(function (s) {
+          return inFY(s.date);
+        });
+        var expInFY = data.expenses.filter(function (e) {
+          return inFY(e.date);
+        });
+        var totalSales = salesInFY.reduce(function (a, s) {
+          return a + (s.amount || 0);
+        }, 0);
+        var totalExp = expInFY.reduce(function (a, e) {
+          return a + (e.amount || 0);
+        }, 0);
+        var profit = totalSales - totalExp;
+        var margin = totalSales > 0 ? profit / totalSales : 0;
+        var receivable = salesInFY.filter(function (s) {
+          return salesStatus(s) === '売掛金';
+        }).reduce(function (a, s) {
+          return a + s.amount;
+        }, 0);
+        var payable = expInFY.filter(function (e) {
+          return expStatus(e) === '買掛金';
+        }).reduce(function (a, e) {
+          return a + e.amount;
+        }, 0);
+        var cashIn = salesInFY.filter(function (s) {
+          return ['現金', 'プラットフォーム入金'].includes(s.payment);
+        }).reduce(function (a, s) {
+          return a + s.amount;
+        }, 0);
+        var cashOut = expInFY.filter(function (e) {
+          return ['現金', 'コンビニ支払い', 'ゆうちょ支払い'].includes(e.payment);
+        }).reduce(function (a, e) {
+          return a + e.amount;
+        }, 0);
+        var cashBal = (data.settings.cashOpeningBalance || 0) + cashIn - cashOut;
+        var bankIn = salesInFY.filter(function (s) {
+          return s.payment === '法人口座振り込み' && salesStatus(s) === '入金済';
+        }).reduce(function (a, s) {
+          return a + s.amount;
+        }, 0);
+        var bankOut = expInFY.filter(function (e) {
+          return e.payment === '法人口座振り込み' && expStatus(e) === '支払済';
+        }).reduce(function (a, e) {
+          return a + e.amount;
+        }, 0);
+        var bankBal = (data.settings.bankOpeningBalance || 0) + bankIn - bankOut;
+        var monthly = {};
+        for (var i = 0; i < 12; i++) {
+          var d = new Date(fyStart);
+          d.setMonth(d.getMonth() + i);
+          var key = d.toISOString().slice(0, 7);
+          monthly[key] = {
+            month: "".concat(d.getMonth() + 1, "\u6708"),
+            売上: 0,
+            支出: 0,
+            利益: 0
+          };
+        }
+        salesInFY.forEach(function (s) {
+          var m = monthOf(s.date);
+          if (monthly[m]) monthly[m].売上 += s.amount;
+        });
+        expInFY.forEach(function (e) {
+          var m = monthOf(e.date);
+          if (monthly[m]) monthly[m].支出 += e.amount;
+        });
+        Object.values(monthly).forEach(function (m) {
+          return m.利益 = m.売上 - m.支出;
+        });
+        return {
+          totalSales: totalSales,
+          totalExp: totalExp,
+          profit: profit,
+          margin: margin,
+          receivable: receivable,
+          payable: payable,
+          cashBal: cashBal,
+          bankBal: bankBal,
+          monthly: Object.values(monthly),
+          salesCount: salesInFY.length,
+          expCount: expInFY.length
+        };
+      }, [data]);
+      return /*#__PURE__*/React.createElement("div", {
+        className: "max-w-6xl mx-auto space-y-4"
+      }, /*#__PURE__*/React.createElement("div", {
+        className: "grid grid-cols-2 lg:grid-cols-4 gap-3"
+      }, /*#__PURE__*/React.createElement(KpiCard, {
+        label: "\u58F2\u4E0A\u9AD8",
+        value: yen(stats.totalSales),
+        sub: "".concat(stats.salesCount, "\u4EF6"),
+        color: "emerald"
+      }), /*#__PURE__*/React.createElement(KpiCard, {
+        label: "\u7DCF\u652F\u51FA",
+        value: yen(stats.totalExp),
+        sub: "".concat(stats.expCount, "\u4EF6"),
+        color: "rose"
+      }), /*#__PURE__*/React.createElement(KpiCard, {
+        label: "\u5229\u76CA",
+        value: yen(stats.profit),
+        sub: "".concat((stats.margin * 100).toFixed(1), "%"),
+        color: stats.profit >= 0 ? 'indigo' : 'rose'
+      }), /*#__PURE__*/React.createElement(KpiCard, {
+        label: "\u5229\u76CA\u7387",
+        value: "".concat((stats.margin * 100).toFixed(1), "%"),
+        sub: "",
+        color: "amber"
+      })), /*#__PURE__*/React.createElement("div", {
+        className: "grid grid-cols-2 lg:grid-cols-4 gap-3"
+      }, /*#__PURE__*/React.createElement(BalCard, {
+        label: "\u9810\u91D1\u6B8B\u9AD8",
+        value: stats.bankBal,
+        color: "sky"
+      }), /*#__PURE__*/React.createElement(BalCard, {
+        label: "\u73FE\u91D1\u6B8B\u9AD8",
+        value: stats.cashBal,
+        color: "amber"
+      }), /*#__PURE__*/React.createElement(BalCard, {
+        label: "\u58F2\u639B\u91D1",
+        value: stats.receivable,
+        color: "emerald",
+        onClick: function onClick() {
+          return onNavigate('receivables');
+        }
+      }), /*#__PURE__*/React.createElement(BalCard, {
+        label: "\u8CB7\u639B\u91D1",
+        value: stats.payable,
+        color: "rose",
+        onClick: function onClick() {
+          return onNavigate('payables');
+        }
+      })), /*#__PURE__*/React.createElement("div", {
+        className: "grid lg:grid-cols-2 gap-4"
+      }, /*#__PURE__*/React.createElement(ChartCard, {
+        title: "\u6708\u5225 \u58F2\u4E0A vs \u652F\u51FA"
+      }, /*#__PURE__*/React.createElement(ResponsiveContainer, null, /*#__PURE__*/React.createElement(BarChart, {
+        data: stats.monthly
+      }, /*#__PURE__*/React.createElement(CartesianGrid, {
+        strokeDasharray: "3 3",
+        stroke: "#e7e5e4"
+      }), /*#__PURE__*/React.createElement(XAxis, {
+        dataKey: "month",
+        stroke: "#78716c",
+        style: {
+          fontSize: 11
+        }
+      }), /*#__PURE__*/React.createElement(YAxis, {
+        stroke: "#78716c",
+        style: {
+          fontSize: 10
+        },
+        tickFormatter: function tickFormatter(v) {
+          return yenShort(v);
+        }
+      }), /*#__PURE__*/React.createElement(Tooltip, {
+        formatter: function formatter(v) {
+          return yen(v);
+        }
+      }), /*#__PURE__*/React.createElement(Legend, {
+        wrapperStyle: {
+          fontSize: 12
+        }
+      }), /*#__PURE__*/React.createElement(Bar, {
+        dataKey: "\u58F2\u4E0A",
+        fill: "#059669"
+      }), /*#__PURE__*/React.createElement(Bar, {
+        dataKey: "\u652F\u51FA",
+        fill: "#e11d48"
+      })))), /*#__PURE__*/React.createElement(ChartCard, {
+        title: "\u6708\u5225 \u5229\u76CA\u63A8\u79FB"
+      }, /*#__PURE__*/React.createElement(ResponsiveContainer, null, /*#__PURE__*/React.createElement(LineChart, {
+        data: stats.monthly
+      }, /*#__PURE__*/React.createElement(CartesianGrid, {
+        strokeDasharray: "3 3",
+        stroke: "#e7e5e4"
+      }), /*#__PURE__*/React.createElement(XAxis, {
+        dataKey: "month",
+        stroke: "#78716c",
+        style: {
+          fontSize: 11
+        }
+      }), /*#__PURE__*/React.createElement(YAxis, {
+        stroke: "#78716c",
+        style: {
+          fontSize: 10
+        },
+        tickFormatter: function tickFormatter(v) {
+          return yenShort(v);
+        }
+      }), /*#__PURE__*/React.createElement(Tooltip, {
+        formatter: function formatter(v) {
+          return yen(v);
+        }
+      }), /*#__PURE__*/React.createElement(Line, {
+        type: "monotone",
+        dataKey: "\u5229\u76CA",
+        stroke: "#4338ca",
+        strokeWidth: 2.5,
+        dot: {
+          r: 4
+        }
+      }))))), /*#__PURE__*/React.createElement("div", {
+        className: "grid grid-cols-2 md:grid-cols-4 gap-3"
+      }, /*#__PURE__*/React.createElement("button", {
+        onClick: function onClick() {
+          return onNavigate('sales');
+        },
+        className: "bg-emerald-600 hover:bg-emerald-700 text-white rounded-lg p-3 md:p-4 flex items-center gap-2 transition shadow-sm"
+      }, /*#__PURE__*/React.createElement(Icon, {
+        name: "TrendingUp",
+        size: 18
+      }), /*#__PURE__*/React.createElement("span", {
+        className: "text-sm font-medium"
+      }, "\u58F2\u4E0A\u3092\u8A18\u5E33")), /*#__PURE__*/React.createElement("button", {
+        onClick: function onClick() {
+          return onNavigate('expenses');
+        },
+        className: "bg-rose-600 hover:bg-rose-700 text-white rounded-lg p-3 md:p-4 flex items-center gap-2 transition shadow-sm"
+      }, /*#__PURE__*/React.createElement(Icon, {
+        name: "TrendingDown",
+        size: 18
+      }), /*#__PURE__*/React.createElement("span", {
+        className: "text-sm font-medium"
+      }, "\u652F\u51FA\u3092\u8A18\u5E33")), /*#__PURE__*/React.createElement("button", {
+        onClick: function onClick() {
+          return onNavigate('bank');
+        },
+        className: "bg-sky-600 hover:bg-sky-700 text-white rounded-lg p-3 md:p-4 flex items-center gap-2 transition shadow-sm"
+      }, /*#__PURE__*/React.createElement(Icon, {
+        name: "Bank",
+        size: 18
+      }), /*#__PURE__*/React.createElement("span", {
+        className: "text-sm font-medium"
+      }, "\u9280\u884C\u7167\u5408")), /*#__PURE__*/React.createElement("button", {
+        onClick: function onClick() {
+          return onNavigate('reports');
+        },
+        className: "bg-indigo-700 hover:bg-indigo-800 text-white rounded-lg p-3 md:p-4 flex items-center gap-2 transition shadow-sm"
+      }, /*#__PURE__*/React.createElement(Icon, {
+        name: "FileText",
+        size: 18
+      }), /*#__PURE__*/React.createElement("span", {
+        className: "text-sm font-medium"
+      }, "\u30EC\u30DD\u30FC\u30C8"))));
+    }
+    function KpiCard(_ref4) {
+      var label = _ref4.label,
+        value = _ref4.value,
+        sub = _ref4.sub,
+        color = _ref4.color;
+      var colors = {
+        emerald: 'border-emerald-300 bg-emerald-50',
+        rose: 'border-rose-300 bg-rose-50',
+        indigo: 'border-indigo-300 bg-indigo-50',
+        amber: 'border-amber-300 bg-amber-50'
+      };
+      return /*#__PURE__*/React.createElement("div", {
+        className: "bg-white border-l-4 ".concat(colors[color], " border border-stone-200 rounded-lg p-3 md:p-4 shadow-sm")
+      }, /*#__PURE__*/React.createElement("div", {
+        className: "text-xs text-stone-500 mb-1"
+      }, label), /*#__PURE__*/React.createElement("div", {
+        className: "text-lg md:text-2xl font-bold tabular-nums font-serif"
+      }, value), sub && /*#__PURE__*/React.createElement("div", {
+        className: "text-xs text-stone-400 mt-0.5"
+      }, sub));
+    }
+    function BalCard(_ref5) {
+      var label = _ref5.label,
+        value = _ref5.value,
+        color = _ref5.color,
+        onClick = _ref5.onClick;
+      var colors = {
+        sky: 'bg-sky-100 text-sky-900 border-sky-200',
+        amber: 'bg-amber-100 text-amber-900 border-amber-200',
+        emerald: 'bg-emerald-100 text-emerald-900 border-emerald-200',
+        rose: 'bg-rose-100 text-rose-900 border-rose-200'
+      };
+      return /*#__PURE__*/React.createElement("button", {
+        onClick: onClick,
+        className: "".concat(colors[color], " border rounded-lg p-3 md:p-4 text-left ").concat(onClick ? 'hover:shadow cursor-pointer' : '', " transition")
+      }, /*#__PURE__*/React.createElement("div", {
+        className: "text-xs opacity-70 mb-1"
+      }, label), /*#__PURE__*/React.createElement("div", {
+        className: "text-lg md:text-xl font-bold tabular-nums font-serif"
+      }, yen(value)));
+    }
+    function ChartCard(_ref6) {
+      var title = _ref6.title,
+        children = _ref6.children;
+      return /*#__PURE__*/React.createElement("div", {
+        className: "bg-white border border-stone-200 rounded-lg p-3 md:p-4 shadow-sm"
+      }, /*#__PURE__*/React.createElement("h3", {
+        className: "text-sm font-semibold text-stone-700 mb-3"
+      }, title), /*#__PURE__*/React.createElement("div", {
+        className: "h-56 md:h-64"
+      }, children));
+    }
+    
+    // ===========================================
+    // 仕訳帳 (Ledger View) - 弥生風
+    // ===========================================
+    function LedgerView(_ref7) {
+      var type = _ref7.type,
+        data = _ref7.data,
+        setData = _ref7.setData,
+        showToast = _ref7.showToast;
+      var isSale = type === 'sale';
+      var records = isSale ? data.sales : data.expenses;
+      var setRecords = function setRecords(fn) {
+        return setData(function (d) {
+          return _objectSpread(_objectSpread({}, d), {}, _defineProperty({}, isSale ? 'sales' : 'expenses', fn(isSale ? d.sales : d.expenses)));
+        });
+      };
+      var cats = isSale ? INCOME_CATS : EXPENSE_CATS;
+      var statusFn = isSale ? salesStatus : expStatus;
+    
+      // 月選択 (デフォルトは最新月)
+      var allMonths = useMemo(function () {
+        var set = new Set(records.map(function (r) {
+          return monthOf(r.date);
+        }).filter(Boolean));
+        if (set.size === 0) set.add(monthOf(today()));
+        return _toConsumableArray(set).sort();
+      }, [records]);
+      var _useState9 = useState(allMonths[allMonths.length - 1]),
+        _useState0 = _slicedToArray(_useState9, 2),
+        selectedMonth = _useState0[0],
+        setSelectedMonth = _useState0[1];
+      useEffect(function () {
+        if (!allMonths.includes(selectedMonth)) {
+          setSelectedMonth(allMonths[allMonths.length - 1]);
+        }
+      }, [allMonths.join(',')]);
+    
+      // 当月データ
+      var monthRecords = useMemo(function () {
+        return records.filter(function (r) {
+          return monthOf(r.date) === selectedMonth;
+        }).sort(function (a, b) {
+          return a.date.localeCompare(b.date) || a.id.localeCompare(b.id);
+        });
+      }, [records, selectedMonth]);
+    
+      // 月別合計
+      var monthTotal = monthRecords.reduce(function (sum, r) {
+        return sum + (r.amount || 0);
+      }, 0);
+      var monthCount = monthRecords.length;
+    
+      // 年度合計（YTD）
+      var ytdTotal = useMemo(function () {
+        var fyStart = data.settings.fiscalYearStart;
+        return records.filter(function (r) {
+          return r.date >= fyStart && r.date <= selectedMonth + '-31';
+        }).reduce(function (sum, r) {
+          return sum + (r.amount || 0);
+        }, 0);
+      }, [records, selectedMonth, data.settings.fiscalYearStart]);
+      var prevMonth = function prevMonth() {
+        var idx = allMonths.indexOf(selectedMonth);
+        if (idx > 0) setSelectedMonth(allMonths[idx - 1]);
+      };
+      var nextMonth = function nextMonth() {
+        var idx = allMonths.indexOf(selectedMonth);
+        if (idx < allMonths.length - 1) setSelectedMonth(allMonths[idx + 1]);
+      };
+    
+      // 新規追加
+      var addRow = function addRow() {
+        var newId = (isSale ? 's' : 'e') + (Math.max.apply(Math, [0].concat(_toConsumableArray(records.map(function (r) {
+          return parseInt(r.id.slice(1)) || 0;
+        })))) + 1);
+        var defaultDate = selectedMonth + '-' + String(new Date().getDate()).padStart(2, '0');
+        var validDate = defaultDate.slice(0, 10);
+        var newRow = isSale ? {
+          id: newId,
+          date: validDate,
+          category: INCOME_CATS[0],
+          content: '',
+          amount: 0,
+          payment: '現金',
+          invoiceStatus: '無し',
+          platform: '暮らしマーケット',
+          note: '',
+          voucherNo: '',
+          fileName: ''
+        } : {
+          id: newId,
+          date: validDate,
+          category: EXPENSE_CATS[0],
+          content: '',
+          amount: 0,
+          payment: '現金',
+          invoiceStatus: '領収書発行済み',
+          note: '',
+          voucherNo: '',
+          fileName: ''
+        };
+        setRecords(function (prev) {
+          return [].concat(_toConsumableArray(prev), [newRow]);
+        });
+        showToast('1行追加しました');
+        // スクロール
+        setTimeout(function () {
+          var el = document.getElementById('ledger-row-' + newId);
+          if (el) el.scrollIntoView({
+            behavior: 'smooth',
+            block: 'center'
+          });
+        }, 100);
+      };
+      var updateRow = useCallback(function (id, field, value) {
+        setData(function (d) {
+          return _objectSpread(_objectSpread({}, d), {}, _defineProperty({}, isSale ? 'sales' : 'expenses', (isSale ? d.sales : d.expenses).map(function (r) {
+            return r.id === id ? _objectSpread(_objectSpread({}, r), {}, _defineProperty({}, field, value)) : r;
+          })));
+        });
+      }, [isSale, setData]);
+      var deleteRow = function deleteRow(id) {
+        if (!confirm('この行を削除しますか？')) return;
+        setRecords(function (prev) {
+          return prev.filter(function (r) {
+            return r.id !== id;
+          });
+        });
+        showToast('削除しました');
+      };
+      var duplicateRow = function duplicateRow(row) {
+        var newId = (isSale ? 's' : 'e') + (Math.max.apply(Math, [0].concat(_toConsumableArray(records.map(function (r) {
+          return parseInt(r.id.slice(1)) || 0;
+        })))) + 1);
+        var copy = _objectSpread(_objectSpread({}, row), {}, {
+          id: newId,
+          date: today()
+        });
+        setRecords(function (prev) {
+          return [].concat(_toConsumableArray(prev), [copy]);
+        });
+        showToast('複製しました');
+      };
+      return /*#__PURE__*/React.createElement("div", {
+        className: "max-w-7xl mx-auto space-y-3"
+      }, /*#__PURE__*/React.createElement("div", {
+        className: "bg-white border border-stone-200 rounded-lg p-3 md:p-4 shadow-sm"
+      }, /*#__PURE__*/React.createElement("div", {
+        className: "flex items-center justify-between flex-wrap gap-2"
+      }, /*#__PURE__*/React.createElement("div", {
+        className: "flex items-center gap-3"
+      }, /*#__PURE__*/React.createElement("h2", {
+        className: "text-xl md:text-2xl font-bold font-serif"
+      }, isSale ? '売上帳' : '支出帳'), /*#__PURE__*/React.createElement("span", {
+        className: "text-xs px-2 py-0.5 rounded ".concat(isSale ? 'bg-emerald-100 text-emerald-700' : 'bg-rose-100 text-rose-700')
+      }, monthCount, "\u4EF6")), /*#__PURE__*/React.createElement("div", {
+        className: "flex items-center gap-2"
+      }, /*#__PURE__*/React.createElement("button", {
+        onClick: prevMonth,
+        disabled: allMonths.indexOf(selectedMonth) === 0,
+        className: "p-1.5 hover:bg-stone-100 rounded disabled:opacity-30"
+      }, /*#__PURE__*/React.createElement(Icon, {
+        name: "ChevronLeft",
+        size: 18
+      })), /*#__PURE__*/React.createElement("select", {
+        value: selectedMonth,
+        onChange: function onChange(e) {
+          return setSelectedMonth(e.target.value);
+        },
+        className: "text-sm font-medium border border-stone-300 rounded px-3 py-1.5 bg-white"
+      }, allMonths.map(function (m) {
+        return /*#__PURE__*/React.createElement("option", {
+          key: m,
+          value: m
+        }, m.replace('-', '年') + '月');
+      })), /*#__PURE__*/React.createElement("button", {
+        onClick: nextMonth,
+        disabled: allMonths.indexOf(selectedMonth) === allMonths.length - 1,
+        className: "p-1.5 hover:bg-stone-100 rounded disabled:opacity-30"
+      }, /*#__PURE__*/React.createElement(Icon, {
+        name: "ChevronRight",
+        size: 18
+      })), /*#__PURE__*/React.createElement("button", {
+        onClick: addRow,
+        className: "ml-2 ".concat(isSale ? 'bg-emerald-600 hover:bg-emerald-700' : 'bg-rose-600 hover:bg-rose-700', " text-white px-3 py-1.5 rounded text-sm font-medium flex items-center gap-1")
+      }, /*#__PURE__*/React.createElement(Icon, {
+        name: "Plus",
+        size: 14
+      }), " \u65B0\u898F\u884C"))), /*#__PURE__*/React.createElement("div", {
+        className: "mt-3 flex items-center gap-4 md:gap-6 text-sm flex-wrap"
+      }, /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement("span", {
+        className: "text-stone-500"
+      }, "\u5F53\u6708\u5408\u8A08:"), ' ', /*#__PURE__*/React.createElement("span", {
+        className: "font-bold tabular-nums font-serif"
+      }, yen(monthTotal))), /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement("span", {
+        className: "text-stone-500"
+      }, "\u5E74\u5EA6\u7D2F\u8A08:"), ' ', /*#__PURE__*/React.createElement("span", {
+        className: "font-bold tabular-nums font-serif"
+      }, yen(ytdTotal))))), /*#__PURE__*/React.createElement("div", {
+        className: "hidden md:block bg-white border border-stone-300 rounded-lg overflow-hidden shadow-sm"
+      }, /*#__PURE__*/React.createElement("div", {
+        className: "overflow-x-auto"
+      }, /*#__PURE__*/React.createElement("table", {
+        className: "w-full text-sm border-collapse"
+      }, /*#__PURE__*/React.createElement("thead", {
+        className: "bg-stone-100 border-b-2 border-stone-300 sticky top-0 z-10"
+      }, /*#__PURE__*/React.createElement("tr", null, /*#__PURE__*/React.createElement("th", {
+        className: "px-2 py-2 text-left font-semibold text-stone-700 border-r border-stone-200",
+        style: {
+          width: 40
+        }
+      }, "No"), /*#__PURE__*/React.createElement("th", {
+        className: "px-2 py-2 text-left font-semibold text-stone-700 border-r border-stone-200",
+        style: {
+          width: 120
+        }
+      }, "\u65E5\u4ED8"), /*#__PURE__*/React.createElement("th", {
+        className: "px-2 py-2 text-left font-semibold text-stone-700 border-r border-stone-200",
+        style: {
+          width: 140
+        }
+      }, "\u79D1\u76EE"), /*#__PURE__*/React.createElement("th", {
+        className: "px-2 py-2 text-left font-semibold text-stone-700 border-r border-stone-200"
+      }, "\u5185\u5BB9/\u53D6\u5F15\u5148"), /*#__PURE__*/React.createElement("th", {
+        className: "px-2 py-2 text-right font-semibold text-stone-700 border-r border-stone-200",
+        style: {
+          width: 130
+        }
+      }, "\u91D1\u984D"), /*#__PURE__*/React.createElement("th", {
+        className: "px-2 py-2 text-left font-semibold text-stone-700 border-r border-stone-200",
+        style: {
+          width: 130
+        }
+      }, "\u652F\u6255\u65B9\u6CD5"), /*#__PURE__*/React.createElement("th", {
+        className: "px-2 py-2 text-left font-semibold text-stone-700 border-r border-stone-200",
+        style: {
+          width: 150
+        }
+      }, "\u8ACB\u6C42\u30FB\u9818\u53CE"), isSale && /*#__PURE__*/React.createElement("th", {
+        className: "px-2 py-2 text-left font-semibold text-stone-700 border-r border-stone-200",
+        style: {
+          width: 130
+        }
+      }, "\u30D7\u30E9\u30C3\u30C8"), /*#__PURE__*/React.createElement("th", {
+        className: "px-2 py-2 text-center font-semibold text-stone-700 border-r border-stone-200",
+        style: {
+          width: 70
+        }
+      }, "\u72B6\u614B"), /*#__PURE__*/React.createElement("th", {
+        className: "px-2 py-2 text-center font-semibold text-stone-700",
+        style: {
+          width: 70
+        }
+      }))), /*#__PURE__*/React.createElement("tbody", null, monthRecords.length === 0 && /*#__PURE__*/React.createElement("tr", null, /*#__PURE__*/React.createElement("td", {
+        colSpan: isSale ? 10 : 9,
+        className: "px-4 py-12 text-center text-stone-400"
+      }, "\u3053\u306E\u6708\u306E\u8A18\u9332\u306F\u307E\u3060\u3042\u308A\u307E\u305B\u3093\u3002", /*#__PURE__*/React.createElement("br", null), /*#__PURE__*/React.createElement("button", {
+        onClick: addRow,
+        className: "mt-2 text-indigo-700 hover:underline text-sm"
+      }, "\u65B0\u898F\u884C\u3092\u8FFD\u52A0 \u2192"))), monthRecords.map(function (row, idx) {
+        return /*#__PURE__*/React.createElement(LedgerRow, {
+          key: row.id,
+          row: row,
+          idx: idx,
+          type: type,
+          updateRow: updateRow,
+          deleteRow: deleteRow,
+          duplicateRow: duplicateRow,
+          statusFn: statusFn
+        });
+      }), monthRecords.length > 0 && /*#__PURE__*/React.createElement("tr", {
+        className: "bg-amber-50 font-bold border-t-2 border-stone-400"
+      }, /*#__PURE__*/React.createElement("td", {
+        colSpan: "4",
+        className: "px-3 py-2.5 text-right text-stone-700"
+      }, "\u6708\u8A08"), /*#__PURE__*/React.createElement("td", {
+        className: "px-2 py-2.5 text-right tabular-nums font-serif text-base"
+      }, yen(monthTotal)), /*#__PURE__*/React.createElement("td", {
+        colSpan: isSale ? 5 : 4
+      })))))), /*#__PURE__*/React.createElement("div", {
+        className: "md:hidden space-y-2"
+      }, monthRecords.length === 0 && /*#__PURE__*/React.createElement("div", {
+        className: "bg-white border border-stone-200 rounded-lg p-8 text-center text-stone-400 text-sm"
+      }, "\u3053\u306E\u6708\u306E\u8A18\u9332\u306F\u307E\u3060\u3042\u308A\u307E\u305B\u3093\u3002", /*#__PURE__*/React.createElement("br", null), /*#__PURE__*/React.createElement("button", {
+        onClick: addRow,
+        className: "mt-2 text-indigo-700 underline"
+      }, "\u65B0\u898F\u8FFD\u52A0")), monthRecords.map(function (row) {
+        return /*#__PURE__*/React.createElement(MobileRow, {
+          key: row.id,
+          row: row,
+          type: type,
+          updateRow: updateRow,
+          deleteRow: deleteRow,
+          statusFn: statusFn
+        });
+      }), monthRecords.length > 0 && /*#__PURE__*/React.createElement("div", {
+        className: "bg-amber-50 border border-amber-200 rounded-lg p-3 flex justify-between items-center font-bold"
+      }, /*#__PURE__*/React.createElement("span", null, "\u6708\u8A08"), /*#__PURE__*/React.createElement("span", {
+        className: "tabular-nums font-serif text-lg"
+      }, yen(monthTotal)))));
+    }
+    
+    // 1行（デスクトップ）
+    function LedgerRow(_ref8) {
+      var row = _ref8.row,
+        idx = _ref8.idx,
+        type = _ref8.type,
+        updateRow = _ref8.updateRow,
+        deleteRow = _ref8.deleteRow,
+        duplicateRow = _ref8.duplicateRow,
+        statusFn = _ref8.statusFn;
+      var isSale = type === 'sale';
+      var status = statusFn(row);
+      var statusColor = {
+        '入金済': 'bg-emerald-100 text-emerald-800',
+        '支払済': 'bg-emerald-100 text-emerald-800',
+        '売掛金': 'bg-rose-100 text-rose-800',
+        '買掛金': 'bg-rose-100 text-rose-800',
+        '確認中': 'bg-stone-100 text-stone-600'
+      }[status];
+      return /*#__PURE__*/React.createElement("tr", {
+        id: "ledger-row-".concat(row.id),
+        className: "border-b border-stone-100 hover:bg-stone-50"
+      }, /*#__PURE__*/React.createElement("td", {
+        className: "px-2 py-1 text-xs text-stone-400 tabular-nums border-r border-stone-100"
+      }, idx + 1), /*#__PURE__*/React.createElement("td", {
+        className: "px-1 py-1 border-r border-stone-100"
+      }, /*#__PURE__*/React.createElement("input", {
+        type: "date",
+        value: row.date,
+        onChange: function onChange(e) {
+          return updateRow(row.id, 'date', e.target.value);
+        },
+        className: "w-full px-1.5 py-1 text-xs border border-transparent hover:border-stone-300 focus:border-indigo-500 focus:outline-none rounded"
+      })), /*#__PURE__*/React.createElement("td", {
+        className: "px-1 py-1 border-r border-stone-100"
+      }, /*#__PURE__*/React.createElement("select", {
+        value: row.category,
+        onChange: function onChange(e) {
+          return updateRow(row.id, 'category', e.target.value);
+        },
+        className: "w-full px-1.5 py-1 text-xs border border-transparent hover:border-stone-300 focus:border-indigo-500 focus:outline-none rounded bg-transparent"
+      }, (isSale ? INCOME_CATS : EXPENSE_CATS).map(function (c) {
+        return /*#__PURE__*/React.createElement("option", {
+          key: c,
+          value: c
+        }, c);
+      }))), /*#__PURE__*/React.createElement("td", {
+        className: "px-1 py-1 border-r border-stone-100"
+      }, /*#__PURE__*/React.createElement("input", {
+        type: "text",
+        value: row.content || '',
+        onChange: function onChange(e) {
+          return updateRow(row.id, 'content', e.target.value);
+        },
+        placeholder: isSale ? '例: 新宿区' : '例: 壁紙仕入',
+        className: "w-full px-1.5 py-1 text-xs border border-transparent hover:border-stone-300 focus:border-indigo-500 focus:outline-none rounded"
+      })), /*#__PURE__*/React.createElement("td", {
+        className: "px-1 py-1 border-r border-stone-100"
+      }, /*#__PURE__*/React.createElement("input", {
+        type: "number",
+        value: row.amount || '',
+        onChange: function onChange(e) {
+          return updateRow(row.id, 'amount', parseInt(e.target.value) || 0);
+        },
+        className: "w-full px-1.5 py-1 text-sm border border-transparent hover:border-stone-300 focus:border-indigo-500 focus:outline-none rounded text-right tabular-nums font-medium"
+      })), /*#__PURE__*/React.createElement("td", {
+        className: "px-1 py-1 border-r border-stone-100"
+      }, /*#__PURE__*/React.createElement("select", {
+        value: row.payment,
+        onChange: function onChange(e) {
+          return updateRow(row.id, 'payment', e.target.value);
+        },
+        className: "w-full px-1.5 py-1 text-xs border border-transparent hover:border-stone-300 focus:border-indigo-500 focus:outline-none rounded bg-transparent"
+      }, /*#__PURE__*/React.createElement("option", {
+        value: ""
+      }), PAYMENTS.map(function (p) {
+        return /*#__PURE__*/React.createElement("option", {
+          key: p,
+          value: p
+        }, p);
+      }))), /*#__PURE__*/React.createElement("td", {
+        className: "px-1 py-1 border-r border-stone-100"
+      }, /*#__PURE__*/React.createElement("select", {
+        value: row.invoiceStatus,
+        onChange: function onChange(e) {
+          return updateRow(row.id, 'invoiceStatus', e.target.value);
+        },
+        className: "w-full px-1.5 py-1 text-xs border border-transparent hover:border-stone-300 focus:border-indigo-500 focus:outline-none rounded bg-transparent"
+      }, /*#__PURE__*/React.createElement("option", {
+        value: ""
+      }), INVOICE_STATUS.map(function (s) {
+        return /*#__PURE__*/React.createElement("option", {
+          key: s,
+          value: s
+        }, s);
+      }))), isSale && /*#__PURE__*/React.createElement("td", {
+        className: "px-1 py-1 border-r border-stone-100"
+      }, /*#__PURE__*/React.createElement("select", {
+        value: row.platform || '',
+        onChange: function onChange(e) {
+          return updateRow(row.id, 'platform', e.target.value);
+        },
+        className: "w-full px-1.5 py-1 text-xs border border-transparent hover:border-stone-300 focus:border-indigo-500 focus:outline-none rounded bg-transparent"
+      }, /*#__PURE__*/React.createElement("option", {
+        value: ""
+      }), PLATFORMS.map(function (p) {
+        return /*#__PURE__*/React.createElement("option", {
+          key: p,
+          value: p
+        }, p);
+      }))), /*#__PURE__*/React.createElement("td", {
+        className: "px-1 py-1 text-center border-r border-stone-100"
+      }, /*#__PURE__*/React.createElement("span", {
+        className: "text-xs px-1.5 py-0.5 rounded ".concat(statusColor)
+      }, status)), /*#__PURE__*/React.createElement("td", {
+        className: "px-1 py-1 text-center"
+      }, /*#__PURE__*/React.createElement("div", {
+        className: "flex gap-0.5 justify-center"
+      }, /*#__PURE__*/React.createElement("button", {
+        onClick: function onClick() {
+          return duplicateRow(row);
+        },
+        className: "p-1 hover:bg-stone-200 rounded text-stone-500",
+        title: "\u8907\u88FD"
+      }, /*#__PURE__*/React.createElement(Icon, {
+        name: "Copy",
+        size: 12
+      })), /*#__PURE__*/React.createElement("button", {
+        onClick: function onClick() {
+          return deleteRow(row.id);
+        },
+        className: "p-1 hover:bg-rose-100 rounded text-rose-500",
+        title: "\u524A\u9664"
+      }, /*#__PURE__*/React.createElement(Icon, {
+        name: "Trash",
+        size: 12
+      })))));
+    }
+    
+    // モバイル行
+    function MobileRow(_ref9) {
+      var row = _ref9.row,
+        type = _ref9.type,
+        updateRow = _ref9.updateRow,
+        deleteRow = _ref9.deleteRow,
+        statusFn = _ref9.statusFn;
+      var _useState1 = useState(false),
+        _useState10 = _slicedToArray(_useState1, 2),
+        expanded = _useState10[0],
+        setExpanded = _useState10[1];
+      var isSale = type === 'sale';
+      var status = statusFn(row);
+      var statusColor = {
+        '入金済': 'bg-emerald-100 text-emerald-800',
+        '支払済': 'bg-emerald-100 text-emerald-800',
+        '売掛金': 'bg-rose-100 text-rose-800',
+        '買掛金': 'bg-rose-100 text-rose-800',
+        '確認中': 'bg-stone-100 text-stone-600'
+      }[status];
+      return /*#__PURE__*/React.createElement("div", {
+        className: "bg-white border border-stone-200 rounded-lg overflow-hidden shadow-sm"
+      }, /*#__PURE__*/React.createElement("div", {
+        className: "p-3 cursor-pointer",
+        onClick: function onClick() {
+          return setExpanded(!expanded);
+        }
+      }, /*#__PURE__*/React.createElement("div", {
+        className: "flex justify-between items-start mb-1"
+      }, /*#__PURE__*/React.createElement("div", {
+        className: "text-xs text-stone-500 tabular-nums"
+      }, row.date), /*#__PURE__*/React.createElement("span", {
+        className: "text-xs px-1.5 py-0.5 rounded ".concat(statusColor)
+      }, status)), /*#__PURE__*/React.createElement("div", {
+        className: "flex justify-between items-center"
+      }, /*#__PURE__*/React.createElement("div", {
+        className: "text-sm font-medium"
+      }, row.category), /*#__PURE__*/React.createElement("div", {
+        className: "text-base font-bold tabular-nums font-serif"
+      }, yen(row.amount))), /*#__PURE__*/React.createElement("div", {
+        className: "text-xs text-stone-600 mt-0.5"
+      }, row.content || '(内容なし)')), expanded && /*#__PURE__*/React.createElement("div", {
+        className: "border-t border-stone-200 p-3 space-y-2 bg-stone-50"
+      }, /*#__PURE__*/React.createElement(Field, {
+        label: "\u65E5\u4ED8"
+      }, /*#__PURE__*/React.createElement("input", {
+        type: "date",
+        value: row.date,
+        onChange: function onChange(e) {
+          return updateRow(row.id, 'date', e.target.value);
+        },
+        className: "w-full px-2 py-1.5 text-sm border border-stone-300 rounded"
+      })), /*#__PURE__*/React.createElement(Field, {
+        label: "\u79D1\u76EE"
+      }, /*#__PURE__*/React.createElement("select", {
+        value: row.category,
+        onChange: function onChange(e) {
+          return updateRow(row.id, 'category', e.target.value);
+        },
+        className: "w-full px-2 py-1.5 text-sm border border-stone-300 rounded bg-white"
+      }, (isSale ? INCOME_CATS : EXPENSE_CATS).map(function (c) {
+        return /*#__PURE__*/React.createElement("option", {
+          key: c,
+          value: c
+        }, c);
+      }))), /*#__PURE__*/React.createElement(Field, {
+        label: "\u5185\u5BB9"
+      }, /*#__PURE__*/React.createElement("input", {
+        type: "text",
+        value: row.content || '',
+        onChange: function onChange(e) {
+          return updateRow(row.id, 'content', e.target.value);
+        },
+        className: "w-full px-2 py-1.5 text-sm border border-stone-300 rounded"
+      })), /*#__PURE__*/React.createElement(Field, {
+        label: "\u91D1\u984D"
+      }, /*#__PURE__*/React.createElement("input", {
+        type: "number",
+        value: row.amount || '',
+        onChange: function onChange(e) {
+          return updateRow(row.id, 'amount', parseInt(e.target.value) || 0);
+        },
+        className: "w-full px-2 py-1.5 text-sm border border-stone-300 rounded text-right tabular-nums"
+      })), /*#__PURE__*/React.createElement(Field, {
+        label: "\u652F\u6255\u65B9\u6CD5"
+      }, /*#__PURE__*/React.createElement("select", {
+        value: row.payment,
+        onChange: function onChange(e) {
+          return updateRow(row.id, 'payment', e.target.value);
+        },
+        className: "w-full px-2 py-1.5 text-sm border border-stone-300 rounded bg-white"
+      }, /*#__PURE__*/React.createElement("option", {
+        value: ""
+      }), PAYMENTS.map(function (p) {
+        return /*#__PURE__*/React.createElement("option", {
+          key: p,
+          value: p
+        }, p);
+      }))), /*#__PURE__*/React.createElement(Field, {
+        label: "\u8ACB\u6C42\u30FB\u9818\u53CE"
+      }, /*#__PURE__*/React.createElement("select", {
+        value: row.invoiceStatus,
+        onChange: function onChange(e) {
+          return updateRow(row.id, 'invoiceStatus', e.target.value);
+        },
+        className: "w-full px-2 py-1.5 text-sm border border-stone-300 rounded bg-white"
+      }, /*#__PURE__*/React.createElement("option", {
+        value: ""
+      }), INVOICE_STATUS.map(function (s) {
+        return /*#__PURE__*/React.createElement("option", {
+          key: s,
+          value: s
+        }, s);
+      }))), isSale && /*#__PURE__*/React.createElement(Field, {
+        label: "\u30D7\u30E9\u30C3\u30C8\u30D5\u30A9\u30FC\u30E0"
+      }, /*#__PURE__*/React.createElement("select", {
+        value: row.platform || '',
+        onChange: function onChange(e) {
+          return updateRow(row.id, 'platform', e.target.value);
+        },
+        className: "w-full px-2 py-1.5 text-sm border border-stone-300 rounded bg-white"
+      }, /*#__PURE__*/React.createElement("option", {
+        value: ""
+      }), PLATFORMS.map(function (p) {
+        return /*#__PURE__*/React.createElement("option", {
+          key: p,
+          value: p
+        }, p);
+      }))), /*#__PURE__*/React.createElement("button", {
+        onClick: function onClick() {
+          return deleteRow(row.id);
+        },
+        className: "w-full mt-2 text-rose-600 border border-rose-200 hover:bg-rose-50 px-3 py-1.5 rounded text-sm flex items-center justify-center gap-1"
+      }, /*#__PURE__*/React.createElement(Icon, {
+        name: "Trash",
+        size: 14
+      }), " \u3053\u306E\u884C\u3092\u524A\u9664")));
+    }
+    function Field(_ref0) {
+      var label = _ref0.label,
+        children = _ref0.children;
+      return /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement("label", {
+        className: "block text-xs font-medium text-stone-600 mb-0.5"
+      }, label), children);
+    }
+    
+    // ===========================================
+    // 売掛金 / 買掛金
+    // ===========================================
+    function ReceivablesView(_ref1) {
+      var data = _ref1.data;
+      var list = useMemo(function () {
+        return data.sales.filter(function (s) {
+          return salesStatus(s) === '売掛金';
+        }).map(function (s) {
+          return _objectSpread(_objectSpread({}, s), {}, {
+            days: daysSince(s.date)
+          });
+        }).sort(function (a, b) {
+          return b.days - a.days;
+        });
+      }, [data.sales]);
+      var total = list.reduce(function (s, x) {
+        return s + x.amount;
+      }, 0);
+      return /*#__PURE__*/React.createElement("div", {
+        className: "max-w-5xl mx-auto space-y-3"
+      }, /*#__PURE__*/React.createElement("div", {
+        className: "bg-white border border-stone-200 rounded-lg p-4 shadow-sm"
+      }, /*#__PURE__*/React.createElement("div", {
+        className: "flex justify-between items-center"
+      }, /*#__PURE__*/React.createElement("h2", {
+        className: "text-xl md:text-2xl font-bold font-serif"
+      }, "\u58F2\u639B\u91D1\u7BA1\u7406"), /*#__PURE__*/React.createElement("div", {
+        className: "text-right"
+      }, /*#__PURE__*/React.createElement("div", {
+        className: "text-xs text-stone-500"
+      }, "\u672A\u56DE\u53CE\u5408\u8A08"), /*#__PURE__*/React.createElement("div", {
+        className: "text-xl font-bold text-rose-700 tabular-nums font-serif"
+      }, yen(total)), /*#__PURE__*/React.createElement("div", {
+        className: "text-xs text-stone-500"
+      }, list.length, "\u4EF6")))), /*#__PURE__*/React.createElement("div", {
+        className: "bg-white border border-stone-200 rounded-lg overflow-hidden shadow-sm"
+      }, /*#__PURE__*/React.createElement("table", {
+        className: "w-full text-sm"
+      }, /*#__PURE__*/React.createElement("thead", {
+        className: "bg-stone-100 border-b border-stone-300"
+      }, /*#__PURE__*/React.createElement("tr", null, /*#__PURE__*/React.createElement("th", {
+        className: "px-3 py-2 text-left font-semibold text-stone-700"
+      }, "\u65E5\u4ED8"), /*#__PURE__*/React.createElement("th", {
+        className: "px-3 py-2 text-left font-semibold text-stone-700 hidden md:table-cell"
+      }, "\u79D1\u76EE"), /*#__PURE__*/React.createElement("th", {
+        className: "px-3 py-2 text-left font-semibold text-stone-700"
+      }, "\u5185\u5BB9"), /*#__PURE__*/React.createElement("th", {
+        className: "px-3 py-2 text-left font-semibold text-stone-700 hidden md:table-cell"
+      }, "\u30D7\u30E9\u30C3\u30C8"), /*#__PURE__*/React.createElement("th", {
+        className: "px-3 py-2 text-right font-semibold text-stone-700"
+      }, "\u91D1\u984D"), /*#__PURE__*/React.createElement("th", {
+        className: "px-3 py-2 text-center font-semibold text-stone-700"
+      }, "\u7D4C\u904E"))), /*#__PURE__*/React.createElement("tbody", null, list.length === 0 && /*#__PURE__*/React.createElement("tr", null, /*#__PURE__*/React.createElement("td", {
+        colSpan: "6",
+        className: "p-8 text-center text-stone-400"
+      }, "\u58F2\u639B\u91D1\u306F\u3042\u308A\u307E\u305B\u3093")), list.map(function (s) {
+        return /*#__PURE__*/React.createElement("tr", {
+          key: s.id,
+          className: "border-b border-stone-100 hover:bg-stone-50 ".concat(s.days > 60 ? 'bg-rose-50/30' : '')
+        }, /*#__PURE__*/React.createElement("td", {
+          className: "px-3 py-2 tabular-nums text-stone-600"
+        }, s.date), /*#__PURE__*/React.createElement("td", {
+          className: "px-3 py-2 hidden md:table-cell"
+        }, s.category), /*#__PURE__*/React.createElement("td", {
+          className: "px-3 py-2"
+        }, s.content), /*#__PURE__*/React.createElement("td", {
+          className: "px-3 py-2 text-xs text-stone-500 hidden md:table-cell"
+        }, s.platform), /*#__PURE__*/React.createElement("td", {
+          className: "px-3 py-2 text-right tabular-nums font-semibold"
+        }, yen(s.amount)), /*#__PURE__*/React.createElement("td", {
+          className: "px-3 py-2 text-center text-xs font-medium ".concat(s.days > 60 ? 'text-rose-600' : s.days > 30 ? 'text-amber-600' : 'text-stone-500')
+        }, s.days, "\u65E5"));
+      })))));
+    }
+    function PayablesView(_ref10) {
+      var data = _ref10.data;
+      var list = useMemo(function () {
+        return data.expenses.filter(function (e) {
+          return expStatus(e) === '買掛金';
+        }).map(function (e) {
+          return _objectSpread(_objectSpread({}, e), {}, {
+            days: daysSince(e.date)
+          });
+        }).sort(function (a, b) {
+          return b.days - a.days;
+        });
+      }, [data.expenses]);
+      var total = list.reduce(function (s, x) {
+        return s + x.amount;
+      }, 0);
+      return /*#__PURE__*/React.createElement("div", {
+        className: "max-w-5xl mx-auto space-y-3"
+      }, /*#__PURE__*/React.createElement("div", {
+        className: "bg-white border border-stone-200 rounded-lg p-4 shadow-sm"
+      }, /*#__PURE__*/React.createElement("div", {
+        className: "flex justify-between items-center"
+      }, /*#__PURE__*/React.createElement("h2", {
+        className: "text-xl md:text-2xl font-bold font-serif"
+      }, "\u8CB7\u639B\u91D1\u7BA1\u7406"), /*#__PURE__*/React.createElement("div", {
+        className: "text-right"
+      }, /*#__PURE__*/React.createElement("div", {
+        className: "text-xs text-stone-500"
+      }, "\u672A\u6255\u3044\u5408\u8A08"), /*#__PURE__*/React.createElement("div", {
+        className: "text-xl font-bold text-rose-700 tabular-nums font-serif"
+      }, yen(total)), /*#__PURE__*/React.createElement("div", {
+        className: "text-xs text-stone-500"
+      }, list.length, "\u4EF6")))), /*#__PURE__*/React.createElement("div", {
+        className: "bg-white border border-stone-200 rounded-lg overflow-hidden shadow-sm"
+      }, /*#__PURE__*/React.createElement("table", {
+        className: "w-full text-sm"
+      }, /*#__PURE__*/React.createElement("thead", {
+        className: "bg-stone-100 border-b border-stone-300"
+      }, /*#__PURE__*/React.createElement("tr", null, /*#__PURE__*/React.createElement("th", {
+        className: "px-3 py-2 text-left font-semibold text-stone-700"
+      }, "\u65E5\u4ED8"), /*#__PURE__*/React.createElement("th", {
+        className: "px-3 py-2 text-left font-semibold text-stone-700 hidden md:table-cell"
+      }, "\u79D1\u76EE"), /*#__PURE__*/React.createElement("th", {
+        className: "px-3 py-2 text-left font-semibold text-stone-700"
+      }, "\u5185\u5BB9"), /*#__PURE__*/React.createElement("th", {
+        className: "px-3 py-2 text-right font-semibold text-stone-700"
+      }, "\u91D1\u984D"), /*#__PURE__*/React.createElement("th", {
+        className: "px-3 py-2 text-center font-semibold text-stone-700"
+      }, "\u7D4C\u904E"))), /*#__PURE__*/React.createElement("tbody", null, list.length === 0 && /*#__PURE__*/React.createElement("tr", null, /*#__PURE__*/React.createElement("td", {
+        colSpan: "5",
+        className: "p-8 text-center text-stone-400"
+      }, "\u8CB7\u639B\u91D1\u306F\u3042\u308A\u307E\u305B\u3093")), list.map(function (e) {
+        return /*#__PURE__*/React.createElement("tr", {
+          key: e.id,
+          className: "border-b border-stone-100 hover:bg-stone-50 ".concat(e.days > 30 ? 'bg-rose-50/30' : '')
+        }, /*#__PURE__*/React.createElement("td", {
+          className: "px-3 py-2 tabular-nums text-stone-600"
+        }, e.date), /*#__PURE__*/React.createElement("td", {
+          className: "px-3 py-2 hidden md:table-cell"
+        }, e.category), /*#__PURE__*/React.createElement("td", {
+          className: "px-3 py-2"
+        }, e.content), /*#__PURE__*/React.createElement("td", {
+          className: "px-3 py-2 text-right tabular-nums font-semibold"
+        }, yen(e.amount)), /*#__PURE__*/React.createElement("td", {
+          className: "px-3 py-2 text-center text-xs font-medium ".concat(e.days > 30 ? 'text-rose-600' : 'text-stone-500')
+        }, e.days, "\u65E5"));
+      })))));
+    }
+    
+    // ===========================================
+    // 銀行照合
+    // ===========================================
+    function BankView(_ref11) {
+      var data = _ref11.data,
+        showToast = _ref11.showToast;
+      var _useState11 = useState([]),
+        _useState12 = _slicedToArray(_useState11, 2),
+        bankRecords = _useState12[0],
+        setBankRecords = _useState12[1];
+      var fileRef = useRef();
+      var handleFile = function handleFile(file) {
+        Papa.parse(file, {
+          header: false,
+          skipEmptyLines: true,
+          complete: function complete(result) {
+            var parsed = [];
+            result.data.forEach(function (row, idx) {
+              if (idx === 0 && row.some(function (c) {
+                return /日付|date/i.test(c || '');
+              })) return;
+              var dateStr = (row[0] || '').replace(/\//g, '-');
+              if (!/\d{4}-\d{1,2}-\d{1,2}/.test(dateStr)) return;
+              parsed.push({
+                date: dateStr,
+                desc: row[1] || '',
+                "in": parseInt((row[2] || '').toString().replace(/[,¥\s]/g, '')) || 0,
+                out: parseInt((row[3] || '').toString().replace(/[,¥\s]/g, '')) || 0
+              });
+            });
+            setBankRecords(parsed);
+            showToast("".concat(parsed.length, "\u4EF6\u8AAD\u307F\u8FBC\u307F\u307E\u3057\u305F"));
+          }
+        });
+      };
+      var bookRecords = useMemo(function () {
+        var recs = [];
+        data.sales.filter(function (s) {
+          return s.payment === '法人口座振り込み' && salesStatus(s) === '入金済';
+        }).forEach(function (s) {
+          recs.push({
+            date: s.date,
+            desc: "".concat(s.category, "/").concat(s.content),
+            "in": s.amount,
+            out: 0,
+            source: '売上'
+          });
+        });
+        data.expenses.filter(function (e) {
+          return e.payment === '法人口座振り込み' && expStatus(e) === '支払済';
+        }).forEach(function (e) {
+          recs.push({
+            date: e.date,
+            desc: "".concat(e.category, "/").concat(e.content),
+            "in": 0,
+            out: e.amount,
+            source: '支出'
+          });
+        });
+        return recs;
+      }, [data]);
+      var matched = useMemo(function () {
+        return bankRecords.map(function (br) {
+          var found = bookRecords.find(function (book) {
+            return book.date === br.date && book["in"] === br["in"] && book.out === br.out;
+          });
+          return _objectSpread(_objectSpread({}, br), {}, {
+            matched: !!found,
+            bookMatch: found
+          });
+        });
+      }, [bankRecords, bookRecords]);
+      return /*#__PURE__*/React.createElement("div", {
+        className: "max-w-5xl mx-auto space-y-3"
+      }, /*#__PURE__*/React.createElement("div", {
+        className: "bg-white border border-stone-200 rounded-lg p-4 shadow-sm"
+      }, /*#__PURE__*/React.createElement("h2", {
+        className: "text-xl md:text-2xl font-bold font-serif mb-1"
+      }, "\u9280\u884C\u7167\u5408"), /*#__PURE__*/React.createElement("p", {
+        className: "text-sm text-stone-500"
+      }, "\u9280\u884C\u660E\u7D30CSV\u3092\u30A2\u30C3\u30D7\u30ED\u30FC\u30C9\u3057\u3001\u5E33\u7C3F\u3068\u81EA\u52D5\u7167\u5408\u3057\u307E\u3059")), /*#__PURE__*/React.createElement("div", {
+        className: "bg-white border-2 border-dashed border-stone-300 rounded-lg p-6 text-center",
+        onDragOver: function onDragOver(e) {
+          return e.preventDefault();
+        },
+        onDrop: function onDrop(e) {
+          e.preventDefault();
+          var f = e.dataTransfer.files[0];
+          if (f) handleFile(f);
+        }
+      }, /*#__PURE__*/React.createElement(Icon, {
+        name: "Upload",
+        size: 28,
+        className: "mx-auto text-stone-400 mb-2"
+      }), /*#__PURE__*/React.createElement("p", {
+        className: "text-sm text-stone-600 mb-2"
+      }, "\u9280\u884C\u660E\u7D30CSV\u3092\u3053\u3053\u306B\u30C9\u30ED\u30C3\u30D7\u3001\u307E\u305F\u306F"), /*#__PURE__*/React.createElement("input", {
+        ref: fileRef,
+        type: "file",
+        accept: ".csv,.tsv",
+        className: "hidden",
+        onChange: function onChange(e) {
+          return e.target.files[0] && handleFile(e.target.files[0]);
+        }
+      }), /*#__PURE__*/React.createElement("button", {
+        onClick: function onClick() {
+          var _fileRef$current;
+          return (_fileRef$current = fileRef.current) === null || _fileRef$current === void 0 ? void 0 : _fileRef$current.click();
+        },
+        className: "text-indigo-700 hover:underline text-sm"
+      }, "\u30D5\u30A1\u30A4\u30EB\u3092\u9078\u629E"), /*#__PURE__*/React.createElement("p", {
+        className: "text-xs text-stone-400 mt-2"
+      }, "\u5217\u9806: \u65E5\u4ED8, \u6458\u8981, \u5165\u91D1, \u51FA\u91D1")), matched.length > 0 && /*#__PURE__*/React.createElement(React.Fragment, null, /*#__PURE__*/React.createElement("div", {
+        className: "grid grid-cols-3 gap-3"
+      }, /*#__PURE__*/React.createElement("div", {
+        className: "bg-stone-100 rounded-md p-3 text-center"
+      }, /*#__PURE__*/React.createElement("div", {
+        className: "text-xs text-stone-500"
+      }, "\u660E\u7D30\u4EF6\u6570"), /*#__PURE__*/React.createElement("div", {
+        className: "text-xl font-bold tabular-nums"
+      }, matched.length)), /*#__PURE__*/React.createElement("div", {
+        className: "bg-emerald-50 rounded-md p-3 text-center"
+      }, /*#__PURE__*/React.createElement("div", {
+        className: "text-xs text-emerald-700"
+      }, "\u4E00\u81F4"), /*#__PURE__*/React.createElement("div", {
+        className: "text-xl font-bold text-emerald-700 tabular-nums"
+      }, matched.filter(function (m) {
+        return m.matched;
+      }).length)), /*#__PURE__*/React.createElement("div", {
+        className: "bg-rose-50 rounded-md p-3 text-center"
+      }, /*#__PURE__*/React.createElement("div", {
+        className: "text-xs text-rose-700"
+      }, "\u672A\u7167\u5408"), /*#__PURE__*/React.createElement("div", {
+        className: "text-xl font-bold text-rose-700 tabular-nums"
+      }, matched.filter(function (m) {
+        return !m.matched;
+      }).length))), /*#__PURE__*/React.createElement("div", {
+        className: "bg-white border border-stone-200 rounded-lg overflow-hidden shadow-sm"
+      }, /*#__PURE__*/React.createElement("div", {
+        className: "overflow-x-auto"
+      }, /*#__PURE__*/React.createElement("table", {
+        className: "w-full text-sm"
+      }, /*#__PURE__*/React.createElement("thead", {
+        className: "bg-stone-100 border-b border-stone-300"
+      }, /*#__PURE__*/React.createElement("tr", null, /*#__PURE__*/React.createElement("th", {
+        className: "px-3 py-2 text-left"
+      }, "\u65E5\u4ED8"), /*#__PURE__*/React.createElement("th", {
+        className: "px-3 py-2 text-left"
+      }, "\u9280\u884C\u6458\u8981"), /*#__PURE__*/React.createElement("th", {
+        className: "px-3 py-2 text-right"
+      }, "\u5165\u91D1"), /*#__PURE__*/React.createElement("th", {
+        className: "px-3 py-2 text-right"
+      }, "\u51FA\u91D1"), /*#__PURE__*/React.createElement("th", {
+        className: "px-3 py-2 text-center"
+      }, "\u7167\u5408"), /*#__PURE__*/React.createElement("th", {
+        className: "px-3 py-2 text-left hidden md:table-cell"
+      }, "\u5E33\u7C3F\u5074"))), /*#__PURE__*/React.createElement("tbody", null, matched.map(function (m, i) {
+        return /*#__PURE__*/React.createElement("tr", {
+          key: i,
+          className: "border-b border-stone-100 ".concat(m.matched ? 'bg-emerald-50/30' : 'bg-rose-50/30')
+        }, /*#__PURE__*/React.createElement("td", {
+          className: "px-3 py-2 tabular-nums text-xs text-stone-600"
+        }, m.date), /*#__PURE__*/React.createElement("td", {
+          className: "px-3 py-2"
+        }, m.desc), /*#__PURE__*/React.createElement("td", {
+          className: "px-3 py-2 text-right tabular-nums text-emerald-700"
+        }, m["in"] ? m["in"].toLocaleString() : ''), /*#__PURE__*/React.createElement("td", {
+          className: "px-3 py-2 text-right tabular-nums text-rose-700"
+        }, m.out ? m.out.toLocaleString() : ''), /*#__PURE__*/React.createElement("td", {
+          className: "px-3 py-2 text-center"
+        }, m.matched ? /*#__PURE__*/React.createElement("span", {
+          className: "text-emerald-700 text-xs font-semibold"
+        }, "\u2713") : /*#__PURE__*/React.createElement("span", {
+          className: "text-rose-700 text-xs font-semibold"
+        }, "\u2717")), /*#__PURE__*/React.createElement("td", {
+          className: "px-3 py-2 text-xs text-stone-600 hidden md:table-cell"
+        }, m.bookMatch ? "".concat(m.bookMatch.source, ": ").concat(m.bookMatch.desc) : '─'));
+      })))))));
+    }
+    
+    // ===========================================
+    // レポート
+    // ===========================================
+    function ReportsView(_ref12) {
+      var data = _ref12.data;
+      var monthly = useMemo(function () {
+        var fyStart = data.settings.fiscalYearStart;
+        var months = [];
+        for (var i = 0; i < 12; i++) {
+          var d = new Date(fyStart);
+          d.setMonth(d.getMonth() + i);
+          var key = d.toISOString().slice(0, 7);
+          months.push({
+            key: key,
+            label: "".concat(d.getMonth() + 1, "\u6708"),
+            売上: 0,
+            件数: 0,
+            支出: 0,
+            利益: 0
+          });
+        }
+        data.sales.forEach(function (s) {
+          var m = months.find(function (mn) {
+            return mn.key === monthOf(s.date);
+          });
+          if (m) {
+            m.売上 += s.amount;
+            m.件数 += 1;
+          }
+        });
+        data.expenses.forEach(function (e) {
+          var m = months.find(function (mn) {
+            return mn.key === monthOf(e.date);
+          });
+          if (m) m.支出 += e.amount;
+        });
+        months.forEach(function (m) {
+          return m.利益 = m.売上 - m.支出;
+        });
+        return months;
+      }, [data]);
+      var pl = useMemo(function () {
+        var totalSales = data.sales.reduce(function (s, x) {
+          return s + x.amount;
+        }, 0);
+        var byCat = {};
+        EXPENSE_CATS.forEach(function (c) {
+          return byCat[c] = 0;
+        });
+        data.expenses.forEach(function (e) {
+          if (byCat[e.category] !== undefined) byCat[e.category] += e.amount;
+        });
+        var material = byCat['材料費'] || 0;
+        var outsource = byCat['外注費'] || 0;
+        var cogs = material + outsource;
+        var grossProfit = totalSales - cogs;
+        var sgaCats = EXPENSE_CATS.filter(function (c) {
+          return !['材料費', '外注費', '租税公課'].includes(c);
+        });
+        var sga = sgaCats.reduce(function (s, c) {
+          return s + (byCat[c] || 0);
+        }, 0);
+        var opProfit = grossProfit - sga;
+        var tax = byCat['租税公課'] || 0;
+        var netProfit = opProfit - tax;
+        return {
+          totalSales: totalSales,
+          material: material,
+          outsource: outsource,
+          cogs: cogs,
+          grossProfit: grossProfit,
+          sga: sga,
+          opProfit: opProfit,
+          tax: tax,
+          netProfit: netProfit,
+          byCat: byCat,
+          sgaCats: sgaCats
+        };
+      }, [data]);
+      return /*#__PURE__*/React.createElement("div", {
+        className: "max-w-5xl mx-auto space-y-4"
+      }, /*#__PURE__*/React.createElement("div", {
+        className: "bg-white border border-stone-200 rounded-lg overflow-hidden shadow-sm"
+      }, /*#__PURE__*/React.createElement("div", {
+        className: "px-4 py-3 bg-stone-100 border-b border-stone-200"
+      }, /*#__PURE__*/React.createElement("h3", {
+        className: "font-semibold"
+      }, "\u6708\u6B21\u96C6\u8A08")), /*#__PURE__*/React.createElement("div", {
+        className: "overflow-x-auto"
+      }, /*#__PURE__*/React.createElement("table", {
+        className: "w-full text-sm"
+      }, /*#__PURE__*/React.createElement("thead", null, /*#__PURE__*/React.createElement("tr", {
+        className: "bg-stone-50 border-b border-stone-200 text-xs"
+      }, /*#__PURE__*/React.createElement("th", {
+        className: "px-3 py-2 text-left"
+      }, "\u6708"), /*#__PURE__*/React.createElement("th", {
+        className: "px-3 py-2 text-right"
+      }, "\u58F2\u4E0A"), /*#__PURE__*/React.createElement("th", {
+        className: "px-3 py-2 text-right"
+      }, "\u4EF6\u6570"), /*#__PURE__*/React.createElement("th", {
+        className: "px-3 py-2 text-right"
+      }, "\u652F\u51FA"), /*#__PURE__*/React.createElement("th", {
+        className: "px-3 py-2 text-right"
+      }, "\u5229\u76CA"), /*#__PURE__*/React.createElement("th", {
+        className: "px-3 py-2 text-right"
+      }, "\u7387"))), /*#__PURE__*/React.createElement("tbody", null, monthly.map(function (m) {
+        return /*#__PURE__*/React.createElement("tr", {
+          key: m.key,
+          className: "border-b border-stone-100"
+        }, /*#__PURE__*/React.createElement("td", {
+          className: "px-3 py-2 font-medium"
+        }, m.label), /*#__PURE__*/React.createElement("td", {
+          className: "px-3 py-2 text-right tabular-nums text-emerald-700"
+        }, yen(m.売上)), /*#__PURE__*/React.createElement("td", {
+          className: "px-3 py-2 text-right tabular-nums text-stone-500"
+        }, m.件数), /*#__PURE__*/React.createElement("td", {
+          className: "px-3 py-2 text-right tabular-nums text-rose-700"
+        }, yen(m.支出)), /*#__PURE__*/React.createElement("td", {
+          className: "px-3 py-2 text-right tabular-nums font-semibold ".concat(m.利益 < 0 ? 'text-rose-600' : '')
+        }, yen(m.利益)), /*#__PURE__*/React.createElement("td", {
+          className: "px-3 py-2 text-right tabular-nums text-xs text-stone-500"
+        }, m.売上 > 0 ? (m.利益 / m.売上 * 100).toFixed(1) + '%' : '-'));
+      }), /*#__PURE__*/React.createElement("tr", {
+        className: "bg-amber-50 font-bold"
+      }, /*#__PURE__*/React.createElement("td", {
+        className: "px-3 py-2"
+      }, "\u5408\u8A08"), /*#__PURE__*/React.createElement("td", {
+        className: "px-3 py-2 text-right tabular-nums"
+      }, yen(monthly.reduce(function (s, m) {
+        return s + m.売上;
+      }, 0))), /*#__PURE__*/React.createElement("td", {
+        className: "px-3 py-2 text-right tabular-nums"
+      }, monthly.reduce(function (s, m) {
+        return s + m.件数;
+      }, 0)), /*#__PURE__*/React.createElement("td", {
+        className: "px-3 py-2 text-right tabular-nums"
+      }, yen(monthly.reduce(function (s, m) {
+        return s + m.支出;
+      }, 0))), /*#__PURE__*/React.createElement("td", {
+        className: "px-3 py-2 text-right tabular-nums"
+      }, yen(monthly.reduce(function (s, m) {
+        return s + m.利益;
+      }, 0))), /*#__PURE__*/React.createElement("td", {
+        className: "px-3 py-2 text-right tabular-nums text-xs"
+      }, function () {
+        var ts = monthly.reduce(function (s, m) {
+          return s + m.売上;
+        }, 0);
+        var tp = monthly.reduce(function (s, m) {
+          return s + m.利益;
+        }, 0);
+        return ts > 0 ? (tp / ts * 100).toFixed(1) + '%' : '-';
+      }())))))), /*#__PURE__*/React.createElement("div", {
+        className: "bg-white border border-stone-200 rounded-lg overflow-hidden shadow-sm"
+      }, /*#__PURE__*/React.createElement("div", {
+        className: "px-4 py-3 bg-stone-100 border-b border-stone-200"
+      }, /*#__PURE__*/React.createElement("h3", {
+        className: "font-semibold"
+      }, "\u640D\u76CA\u8A08\u7B97\u66F8\uFF08\u5E74\u5EA6\uFF09")), /*#__PURE__*/React.createElement("table", {
+        className: "w-full text-sm"
+      }, /*#__PURE__*/React.createElement("tbody", null, /*#__PURE__*/React.createElement("tr", {
+        className: "bg-indigo-700 text-white"
+      }, /*#__PURE__*/React.createElement("td", {
+        colSpan: "3",
+        className: "px-4 py-2 font-semibold"
+      }, "\u3010\u58F2\u4E0A\u9AD8\u3011")), /*#__PURE__*/React.createElement("tr", null, /*#__PURE__*/React.createElement("td", {
+        className: "pl-8 pr-4 py-1.5"
+      }, "\u5DE5\u4E8B\u58F2\u4E0A\u9AD8"), /*#__PURE__*/React.createElement("td", {
+        className: "px-4 py-1.5 text-right tabular-nums"
+      }, yen(pl.totalSales)), /*#__PURE__*/React.createElement("td", {
+        className: "px-4 py-1.5 text-right text-stone-500 text-xs"
+      }, "100.0%")), /*#__PURE__*/React.createElement("tr", {
+        className: "bg-amber-50 font-bold"
+      }, /*#__PURE__*/React.createElement("td", {
+        className: "pl-4 py-2"
+      }, "\u58F2\u4E0A\u9AD8\u5408\u8A08"), /*#__PURE__*/React.createElement("td", {
+        className: "px-4 py-2 text-right tabular-nums"
+      }, yen(pl.totalSales)), /*#__PURE__*/React.createElement("td", {
+        className: "px-4 py-2 text-right"
+      }, "100.0%")), /*#__PURE__*/React.createElement("tr", {
+        className: "bg-indigo-700 text-white"
+      }, /*#__PURE__*/React.createElement("td", {
+        colSpan: "3",
+        className: "px-4 py-2 font-semibold"
+      }, "\u3010\u58F2\u4E0A\u539F\u4FA1\u3011")), /*#__PURE__*/React.createElement("tr", null, /*#__PURE__*/React.createElement("td", {
+        className: "pl-8 pr-4 py-1.5"
+      }, "\u6750\u6599\u8CBB"), /*#__PURE__*/React.createElement("td", {
+        className: "px-4 py-1.5 text-right tabular-nums"
+      }, yen(pl.material)), /*#__PURE__*/React.createElement("td", {
+        className: "px-4 py-1.5 text-right text-stone-500 text-xs"
+      }, pl.totalSales > 0 ? (pl.material / pl.totalSales * 100).toFixed(1) : 0, "%")), /*#__PURE__*/React.createElement("tr", null, /*#__PURE__*/React.createElement("td", {
+        className: "pl-8 pr-4 py-1.5"
+      }, "\u5916\u6CE8\u8CBB"), /*#__PURE__*/React.createElement("td", {
+        className: "px-4 py-1.5 text-right tabular-nums"
+      }, yen(pl.outsource)), /*#__PURE__*/React.createElement("td", {
+        className: "px-4 py-1.5 text-right text-stone-500 text-xs"
+      }, pl.totalSales > 0 ? (pl.outsource / pl.totalSales * 100).toFixed(1) : 0, "%")), /*#__PURE__*/React.createElement("tr", {
+        className: "bg-amber-50 font-bold"
+      }, /*#__PURE__*/React.createElement("td", {
+        className: "pl-4 py-2"
+      }, "\u58F2\u4E0A\u539F\u4FA1\u5408\u8A08"), /*#__PURE__*/React.createElement("td", {
+        className: "px-4 py-2 text-right tabular-nums"
+      }, yen(pl.cogs)), /*#__PURE__*/React.createElement("td", {
+        className: "px-4 py-2 text-right text-stone-500"
+      }, pl.totalSales > 0 ? (pl.cogs / pl.totalSales * 100).toFixed(1) : 0, "%")), /*#__PURE__*/React.createElement("tr", {
+        className: "bg-indigo-100 font-bold"
+      }, /*#__PURE__*/React.createElement("td", {
+        className: "pl-4 py-2"
+      }, "\u58F2\u4E0A\u7DCF\u5229\u76CA"), /*#__PURE__*/React.createElement("td", {
+        className: "px-4 py-2 text-right tabular-nums"
+      }, yen(pl.grossProfit)), /*#__PURE__*/React.createElement("td", {
+        className: "px-4 py-2 text-right text-stone-500"
+      }, pl.totalSales > 0 ? (pl.grossProfit / pl.totalSales * 100).toFixed(1) : 0, "%")), /*#__PURE__*/React.createElement("tr", {
+        className: "bg-indigo-700 text-white"
+      }, /*#__PURE__*/React.createElement("td", {
+        colSpan: "3",
+        className: "px-4 py-2 font-semibold"
+      }, "\u3010\u8CA9\u7BA1\u8CBB\u3011")), pl.sgaCats.map(function (c) {
+        return pl.byCat[c] > 0 && /*#__PURE__*/React.createElement("tr", {
+          key: c
+        }, /*#__PURE__*/React.createElement("td", {
+          className: "pl-8 pr-4 py-1.5"
+        }, c), /*#__PURE__*/React.createElement("td", {
+          className: "px-4 py-1.5 text-right tabular-nums"
+        }, yen(pl.byCat[c])), /*#__PURE__*/React.createElement("td", {
+          className: "px-4 py-1.5 text-right text-stone-500 text-xs"
+        }, pl.totalSales > 0 ? (pl.byCat[c] / pl.totalSales * 100).toFixed(1) : 0, "%"));
+      }), /*#__PURE__*/React.createElement("tr", {
+        className: "bg-amber-50 font-bold"
+      }, /*#__PURE__*/React.createElement("td", {
+        className: "pl-4 py-2"
+      }, "\u8CA9\u7BA1\u8CBB\u5408\u8A08"), /*#__PURE__*/React.createElement("td", {
+        className: "px-4 py-2 text-right tabular-nums"
+      }, yen(pl.sga)), /*#__PURE__*/React.createElement("td", {
+        className: "px-4 py-2 text-right text-stone-500"
+      }, pl.totalSales > 0 ? (pl.sga / pl.totalSales * 100).toFixed(1) : 0, "%")), /*#__PURE__*/React.createElement("tr", {
+        className: "bg-indigo-100 font-bold"
+      }, /*#__PURE__*/React.createElement("td", {
+        className: "pl-4 py-2"
+      }, "\u55B6\u696D\u5229\u76CA"), /*#__PURE__*/React.createElement("td", {
+        className: "px-4 py-2 text-right tabular-nums"
+      }, yen(pl.opProfit)), /*#__PURE__*/React.createElement("td", {
+        className: "px-4 py-2 text-right text-stone-500"
+      }, pl.totalSales > 0 ? (pl.opProfit / pl.totalSales * 100).toFixed(1) : 0, "%")), /*#__PURE__*/React.createElement("tr", null, /*#__PURE__*/React.createElement("td", {
+        className: "pl-8 pr-4 py-1.5"
+      }, "\u79DF\u7A0E\u516C\u8AB2"), /*#__PURE__*/React.createElement("td", {
+        className: "px-4 py-1.5 text-right tabular-nums"
+      }, yen(pl.tax)), /*#__PURE__*/React.createElement("td", {
+        className: "px-4 py-1.5 text-right text-stone-500 text-xs"
+      }, pl.totalSales > 0 ? (pl.tax / pl.totalSales * 100).toFixed(1) : 0, "%")), /*#__PURE__*/React.createElement("tr", {
+        className: "bg-amber-100 font-bold text-base"
+      }, /*#__PURE__*/React.createElement("td", {
+        className: "pl-4 py-3"
+      }, "\u7A0E\u5F15\u524D\u5F53\u671F\u7D14\u5229\u76CA"), /*#__PURE__*/React.createElement("td", {
+        className: "px-4 py-3 text-right tabular-nums"
+      }, yen(pl.netProfit)), /*#__PURE__*/React.createElement("td", {
+        className: "px-4 py-3 text-right"
+      }, pl.totalSales > 0 ? (pl.netProfit / pl.totalSales * 100).toFixed(1) : 0, "%"))))));
+    }
+    
+    // ===========================================
+    // データ管理（エクスポート/インポート）
+    // ===========================================
+    function ExportView(_ref13) {
+      var data = _ref13.data,
+        setData = _ref13.setData,
+        showToast = _ref13.showToast;
+      var exportExcel = function exportExcel() {
+        var wb = XLSX.utils.book_new();
+        var salesData = [['日付', '科目', '内容', '金額', '支払い方法', '請求・領収', 'プラットフォーム', '備考', '入金状況']].concat(_toConsumableArray(data.sales.map(function (s) {
+          return [s.date, s.category, s.content, s.amount, s.payment, s.invoiceStatus, s.platform, s.note, salesStatus(s)];
+        })));
+        XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet(salesData), '売上');
+        var expData = [['日付', '科目', '内容', '金額', '支払い方法', '請求・領収', '備考', '支払状況']].concat(_toConsumableArray(data.expenses.map(function (e) {
+          return [e.date, e.category, e.content, e.amount, e.payment, e.invoiceStatus, e.note, expStatus(e)];
+        })));
+        XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet(expData), '支出');
+        XLSX.writeFile(wb, "\u8A18\u5E33\u30C7\u30FC\u30BF_".concat(today(), ".xlsx"));
+        showToast('Excelをダウンロードしました');
+      };
+      var exportJSON = function exportJSON() {
+        var blob = new Blob([JSON.stringify(data, null, 2)], {
+          type: 'application/json'
+        });
+        var a = document.createElement('a');
+        a.href = URL.createObjectURL(blob);
+        a.download = "\u8A18\u5E33\u30D0\u30C3\u30AF\u30A2\u30C3\u30D7_".concat(today(), ".json");
+        a.click();
+        showToast('バックアップを保存しました');
+      };
+      var importJSON = function importJSON(e) {
+        var file = e.target.files[0];
+        if (!file) return;
+        var reader = new FileReader();
+        reader.onload = function (ev) {
+          try {
+            var imp = JSON.parse(ev.target.result);
+            if (imp.sales && imp.expenses) {
+              if (confirm('現在のデータを置き換えます。よろしいですか？')) {
+                setData(imp);
+                showToast('インポート完了');
+              }
+            }
+          } catch (e) {
+            showToast('ファイル形式エラー', 'error');
+          }
+        };
+        reader.readAsText(file);
+      };
+      return /*#__PURE__*/React.createElement("div", {
+        className: "max-w-3xl mx-auto space-y-4"
+      }, /*#__PURE__*/React.createElement("h2", {
+        className: "text-2xl font-bold font-serif"
+      }, "\u30C7\u30FC\u30BF\u7BA1\u7406"), /*#__PURE__*/React.createElement("div", {
+        className: "bg-white border border-stone-200 rounded-lg p-4 shadow-sm space-y-3"
+      }, /*#__PURE__*/React.createElement("h3", {
+        className: "font-semibold flex items-center gap-2"
+      }, /*#__PURE__*/React.createElement(Icon, {
+        name: "FileText",
+        size: 16
+      }), "\u7A0E\u7406\u58EB\u63D0\u51FA\u7528\u30A8\u30AF\u30B9\u30DD\u30FC\u30C8"), /*#__PURE__*/React.createElement("button", {
+        onClick: exportExcel,
+        className: "bg-indigo-700 hover:bg-indigo-800 text-white px-4 py-2 rounded text-sm font-medium flex items-center gap-2"
+      }, /*#__PURE__*/React.createElement(Icon, {
+        name: "Download",
+        size: 14
+      }), " Excel\u30D5\u30A1\u30A4\u30EB\u3068\u3057\u3066\u4FDD\u5B58")), /*#__PURE__*/React.createElement("div", {
+        className: "bg-white border border-stone-200 rounded-lg p-4 shadow-sm space-y-3"
+      }, /*#__PURE__*/React.createElement("h3", {
+        className: "font-semibold flex items-center gap-2"
+      }, /*#__PURE__*/React.createElement(Icon, {
+        name: "Save",
+        size: 16
+      }), "\u30D0\u30C3\u30AF\u30A2\u30C3\u30D7\u3068\u5FA9\u5143"), /*#__PURE__*/React.createElement("p", {
+        className: "text-sm text-stone-500"
+      }, "\u5225\u306E\u7AEF\u672B\u3067\u4F7F\u3046\u30FB\u30C7\u30FC\u30BF\u304C\u6D88\u3048\u308B\u524D\u306B\u3002\u67081\u56DE\u306F\u63A8\u5968\u3002"), /*#__PURE__*/React.createElement("div", {
+        className: "flex flex-wrap gap-2"
+      }, /*#__PURE__*/React.createElement("button", {
+        onClick: exportJSON,
+        className: "border border-stone-300 hover:bg-stone-50 px-4 py-2 rounded text-sm flex items-center gap-2"
+      }, /*#__PURE__*/React.createElement(Icon, {
+        name: "Download",
+        size: 14
+      }), " \u30D0\u30C3\u30AF\u30A2\u30C3\u30D7\u4F5C\u6210"), /*#__PURE__*/React.createElement("label", {
+        className: "border border-stone-300 hover:bg-stone-50 px-4 py-2 rounded text-sm flex items-center gap-2 cursor-pointer"
+      }, /*#__PURE__*/React.createElement(Icon, {
+        name: "Upload",
+        size: 14
+      }), " \u5FA9\u5143\uFF08JSON\u3092\u9078\u629E\uFF09", /*#__PURE__*/React.createElement("input", {
+        type: "file",
+        accept: ".json",
+        onChange: importJSON,
+        className: "hidden"
+      })))), /*#__PURE__*/React.createElement("div", {
+        className: "bg-amber-50 border border-amber-200 rounded-lg p-4 text-sm text-amber-900"
+      }, /*#__PURE__*/React.createElement("p", {
+        className: "font-semibold mb-1"
+      }, "\u26A0\uFE0F \u30C7\u30FC\u30BF\u306F\u30D6\u30E9\u30A6\u30B6\u306B\u4FDD\u5B58\u3055\u308C\u3066\u3044\u307E\u3059"), /*#__PURE__*/React.createElement("p", null, "\u3053\u306E\u30D6\u30E9\u30A6\u30B6\u306E\u30AD\u30E3\u30C3\u30B7\u30E5\u3092\u30AF\u30EA\u30A2\u3059\u308B\u3068\u6D88\u3048\u307E\u3059\u3002\u67081\u56DE\u30D0\u30C3\u30AF\u30A2\u30C3\u30D7\u3092\u53D6\u308B\u3053\u3068\u3092\u5F37\u304F\u304A\u3059\u3059\u3081\u3057\u307E\u3059\u3002")));
+    }
+    
+    // ===========================================
+    // 設定
+    // ===========================================
+    function SettingsView(_ref14) {
+      var data = _ref14.data,
+        setData = _ref14.setData,
+        showToast = _ref14.showToast;
+      var _useState13 = useState(data.settings),
+        _useState14 = _slicedToArray(_useState13, 2),
+        form = _useState14[0],
+        setForm = _useState14[1];
+      var save = function save() {
+        setData(function (d) {
+          return _objectSpread(_objectSpread({}, d), {}, {
+            settings: _objectSpread(_objectSpread({}, form), {}, {
+              bankOpeningBalance: parseInt(form.bankOpeningBalance) || 0,
+              cashOpeningBalance: parseInt(form.cashOpeningBalance) || 0
+            })
+          });
+        });
+        showToast('設定を保存しました');
+      };
+      var clearAll = function clearAll() {
+        if (!confirm('すべての記帳データを削除します。バックアップを取りましたか？\n\n本当に実行しますか？')) return;
+        if (!confirm('最終確認: 全データを削除します')) return;
+        setData({
+          sales: [],
+          expenses: [],
+          settings: data.settings
+        });
+        showToast('全データを削除しました');
+      };
+      return /*#__PURE__*/React.createElement("div", {
+        className: "max-w-2xl mx-auto space-y-4"
+      }, /*#__PURE__*/React.createElement("h2", {
+        className: "text-2xl font-bold font-serif"
+      }, "\u8A2D\u5B9A"), /*#__PURE__*/React.createElement("div", {
+        className: "bg-white border border-stone-200 rounded-lg p-4 shadow-sm space-y-3"
+      }, /*#__PURE__*/React.createElement("h3", {
+        className: "font-semibold"
+      }, "\u4F1A\u8A08\u5E74\u5EA6"), /*#__PURE__*/React.createElement(Field, {
+        label: "\u671F\u9996\u65E5"
+      }, /*#__PURE__*/React.createElement("input", {
+        type: "date",
+        value: form.fiscalYearStart,
+        onChange: function onChange(e) {
+          return setForm(_objectSpread(_objectSpread({}, form), {}, {
+            fiscalYearStart: e.target.value
+          }));
+        },
+        className: "w-full border border-stone-300 rounded px-3 py-2 text-sm"
+      })), /*#__PURE__*/React.createElement("p", {
+        className: "text-xs text-stone-500"
+      }, "\u901A\u5E38\u306F10\u67081\u65E5\uFF089\u6708\u6C7A\u7B97\u6CD5\u4EBA\uFF09")), /*#__PURE__*/React.createElement("div", {
+        className: "bg-white border border-stone-200 rounded-lg p-4 shadow-sm space-y-3"
+      }, /*#__PURE__*/React.createElement("h3", {
+        className: "font-semibold"
+      }, "\u671F\u9996\u6B8B\u9AD8"), /*#__PURE__*/React.createElement(Field, {
+        label: "\u671F\u9996 \u9810\u91D1\u6B8B\u9AD8"
+      }, /*#__PURE__*/React.createElement("input", {
+        type: "number",
+        value: form.bankOpeningBalance || '',
+        onChange: function onChange(e) {
+          return setForm(_objectSpread(_objectSpread({}, form), {}, {
+            bankOpeningBalance: e.target.value
+          }));
+        },
+        className: "w-full border border-stone-300 rounded px-3 py-2 text-sm text-right tabular-nums"
+      })), /*#__PURE__*/React.createElement(Field, {
+        label: "\u671F\u9996 \u73FE\u91D1\u6B8B\u9AD8"
+      }, /*#__PURE__*/React.createElement("input", {
+        type: "number",
+        value: form.cashOpeningBalance || '',
+        onChange: function onChange(e) {
+          return setForm(_objectSpread(_objectSpread({}, form), {}, {
+            cashOpeningBalance: e.target.value
+          }));
+        },
+        className: "w-full border border-stone-300 rounded px-3 py-2 text-sm text-right tabular-nums"
+      }))), /*#__PURE__*/React.createElement("button", {
+        onClick: save,
+        className: "bg-indigo-700 hover:bg-indigo-800 text-white px-6 py-2.5 rounded font-medium text-sm"
+      }, "\u8A2D\u5B9A\u3092\u4FDD\u5B58"), /*#__PURE__*/React.createElement("div", {
+        className: "bg-rose-50 border border-rose-200 rounded-lg p-4 space-y-3"
+      }, /*#__PURE__*/React.createElement("h3", {
+        className: "font-semibold text-rose-900 flex items-center gap-2"
+      }, /*#__PURE__*/React.createElement(Icon, {
+        name: "AlertTriangle",
+        size: 16
+      }), "\u5371\u967A\u306A\u64CD\u4F5C"), /*#__PURE__*/React.createElement("button", {
+        onClick: clearAll,
+        className: "text-sm text-rose-700 border border-rose-300 hover:bg-rose-100 px-3 py-1.5 rounded"
+      }, "\u5168\u30C7\u30FC\u30BF\u3092\u524A\u9664")));
+    }
+    ReactDOM.createRoot(document.getElementById('root')).render(React.createElement(App));
+  } catch(e) {
+    showError('アプリ起動エラー', (e && e.stack) || String(e));
+  }
+});
+</script>
+</body>
+</html>
